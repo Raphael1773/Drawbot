@@ -1,0 +1,61 @@
+//---------------------------------------------------------
+// FONCTION VIRAGE GAUCHE
+//---------------------------------------------------------
+void VirageGauche(int pwrDroitBase, int pwrGaucheBase, long distanceTicksDroit) {
+  pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
+  float ratio = (float)pwrGaucheBase / (float)pwrDroitBase;
+  Serial.println("--- DEBUT VIRAGE GAUCHE ---");
+
+  while (pasDroit < distanceTicksDroit) {
+    long ecart = pasGauche - (pasDroit * ratio); 
+    float derivee = ecart - ecartPrecedent;
+    int correction = (ecart * Kp) + (derivee * Kd);
+    ecartPrecedent = ecart;
+
+    int pwrG = constrain(pwrGaucheBase - correction, 0, 255);
+
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+    ledcWrite(canalDroit, pwrDroitBase);
+    ledcWrite(canalGauche, pwrG);
+
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("VIRAGE GAUCHE - D:%ld G:%ld | Erreur:%d | PwrG Final:%d\n", pasDroit, pasGauche, correction, pwrG);
+      timer = millis();
+    }
+    ArduinoOTA.handle(); yield();
+  }
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
+
+//---------------------------------------------------------
+// FONCTION VIRAGE DROITE
+//---------------------------------------------------------
+void VirageDroite(int pwrDroitBase, int pwrGaucheBase, long distanceTicksGauche) {
+  pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
+  float ratio = (float)pwrDroitBase / (float)pwrGaucheBase;
+  Serial.println("--- DEBUT VIRAGE DROITE ---");
+
+  while (pasGauche < distanceTicksGauche) {
+    long ecart = pasDroit - (pasGauche * ratio); 
+    float derivee = ecart - ecartPrecedent;
+    int correction = (ecart * Kp) + (derivee * Kd);
+    ecartPrecedent = ecart;
+
+    int pwrD = constrain(pwrDroitBase - correction, 0, 255);
+
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+    ledcWrite(canalDroit, pwrD);
+    ledcWrite(canalGauche, pwrGaucheBase);
+
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("VIRAGE DROITE - D:%ld G:%ld | Erreur:%d | PwrD Final:%d\n", pasDroit, pasGauche, correction, pwrD);
+      timer = millis();
+    }
+    ArduinoOTA.handle(); yield();
+  }
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
