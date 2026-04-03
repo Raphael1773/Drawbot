@@ -1,0 +1,273 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+// User led
+//pour savoir si la carte marche ou non 
+#define LEDU1 25
+#define LEDU2 26
+
+// Enable moteurs droit et gauche
+#define EN_D 23
+#define EN_G 4
+
+// Commande PWM moteur droit
+#define IN_1_D 19
+#define IN_2_D 18
+
+// Commande PWM moteur gauche
+#define IN_1_G 17
+#define IN_2_G 16
+
+// --- ENCODEURS QUADRATURE ---
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// I2C
+#define SDA 21
+#define SCL 22
+
+//Variable du Kd
+long ecartPrecedent = 0; 
+float Kd = 0.8;
+
+//Variables du Kp
+float Kp = 1.5; 
+
+//Configuration Wifi
+const char* ssid = "Draw_GOAAAT";
+const char* password = "12345678";
+const int freq = 5000;
+const int resolution = 8;
+const int canalDroit = 0;
+const int canalGauche = 1;
+
+volatile long pasDroit = 0;
+volatile long pasGauche = 0;
+
+void IRAM_ATTR ISR_Droit() { pasDroit++; }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+bool testEnCours = true;
+
+//---------------------------------------------------------
+// FONCTION LIGNE DROITE (TON BLOC EXACT)
+//---------------------------------------------------------
+void LigneDroite(int pwrDroitBase, int pwrGaucheBase, long distanceTicksLigne) {
+  pasDroit = 0;
+  pasGauche = 0;
+  ecartPrecedent = 0;
+
+  while (pasDroit < distanceTicksLigne) {
+
+    
+    // 1. Calcul de l'écart (Erreur)
+    // Si écart > 0, la roue gauche est en avance
+    long ecart = pasGauche - pasDroit; 
+
+    //Calcul d'une vitesse de variation en fonction de la puissance de correction
+    float derivee = ecart - ecartPrecedent;
+    
+    // 2. Calcul de la correction
+    int correction = (ecart * Kp) + (derivee * Kd);
+
+    // On met à jour l'état de l'écart
+    ecartPrecedent = ecart;
+
+    // 3. Application des puissances
+    int pwrDroit = pwrDroitBase;               // puissance défini dans le void
+    int pwrGauche = pwrGaucheBase - correction; // puissance ajustée
+
+    // Sécurité pour ne pas descendre en dessous de 0 ou dépasser 255
+    pwrGauche = constrain(pwrGauche, 0, 255);
+
+    // --- ENVOI AUX MOTEURS (Sens AVANT) ---
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+
+    ledcWrite(canalDroit, pwrDroit);
+    ledcWrite(canalGauche, pwrGauche);
+
+    // Debug toutes les 100ms
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("D:%ld G:%ld | Correction Gauche:%d\n", pasDroit, pasGauche, correction);
+      timer = millis();
+    }
+    ArduinoOTA.handle();
+    yield();
+  } 
+
+  ledcWrite(canalDroit, 0);
+  ledcWrite(canalGauche, 0);
+  Serial.println("Erreur système... Non mdr c juste le code est fini");
+}
+
+//---------------------------------------------------------
+// FONCTION VIRAGE GAUCHE
+//---------------------------------------------------------
+void VirageGauche(int pwrDroitBase, int pwrGaucheBase, long distanceTicksDroit) {
+  pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
+  float ratio = (float)pwrGaucheBase / (float)pwrDroitBase;
+  Serial.println("--- DEBUT VIRAGE GAUCHE ---");
+
+  while (pasDroit < distanceTicksDroit) {
+    long ecart = pasGauche - (pasDroit * ratio); 
+    float derivee = ecart - ecartPrecedent;
+    int correction = (ecart * Kp) + (derivee * Kd);
+    ecartPrecedent = ecart;
+
+    int pwrG = constrain(pwrGaucheBase - correction, 0, 255);
+
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+    ledcWrite(canalDroit, pwrDroitBase);
+    ledcWrite(canalGauche, pwrG);
+
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("VIRAGE GAUCHE - D:%ld G:%ld | Erreur:%d | PwrG Final:%d\n", pasDroit, pasGauche, correction, pwrG);
+      timer = millis();
+    }
+    ArduinoOTA.handle(); yield();
+  }
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
+
+//---------------------------------------------------------
+// FONCTION VIRAGE DROITE
+//---------------------------------------------------------
+void VirageDroite(int pwrDroitBase, int pwrGaucheBase, long distanceTicksGauche) {
+  pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
+  float ratio = (float)pwrDroitBase / (float)pwrGaucheBase;
+  Serial.println("--- DEBUT VIRAGE DROITE ---");
+
+  while (pasGauche < distanceTicksGauche) {
+    long ecart = pasDroit - (pasGauche * ratio); 
+    float derivee = ecart - ecartPrecedent;
+    int correction = (ecart * Kp) + (derivee * Kd);
+    ecartPrecedent = ecart;
+
+    int pwrD = constrain(pwrDroitBase - correction, 0, 255);
+
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+    ledcWrite(canalDroit, pwrD);
+    ledcWrite(canalGauche, pwrGaucheBase);
+
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("VIRAGE DROITE - D:%ld G:%ld | Erreur:%d | PwrD Final:%d\n", pasDroit, pasGauche, correction, pwrD);
+      timer = millis();
+    }
+    ArduinoOTA.handle(); yield();
+  }
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
+
+void Reculer(int pwrDroiteBase, int pwrGaucheBase, long distanceTicksArriere) {
+  pasDroit = 0;
+  pasGauche = 0;
+  ecartPrecedent = 0;
+
+  while (pasDroit < distanceTicksArriere) {
+    // 1. Calcul de l'écart (Erreur)
+    // Si écart > 0, la roue gauche est en avance
+    long ecart = pasGauche - pasDroit; 
+
+    //Calcul d'une vitesse de variation en fonction de la puissance de correction
+    float derivee = ecart - ecartPrecedent;
+    
+    // 2. Calcul de la correction
+    int correction = (ecart * Kp) + (derivee * Kd);
+
+    // On met à jour l'état de l'écart
+    ecartPrecedent = ecart;
+
+    // 3. Application des puissances
+    int pwrDroit = 200;             // Puissance fixe pour la référence
+    int pwrGauche = 200 - correction; // On ralentit le gauche s'il avance trop
+
+    // Sécurité pour ne pas descendre en dessous de 0 ou dépasser 255
+    pwrGauche = constrain(pwrGauche, 0, 255);
+
+    // --- ENVOI AUX MOTEURS (Sens ARRIERE) ---
+    digitalWrite(IN_1_D, HIGH);  digitalWrite(IN_2_D, LOW); 
+    digitalWrite(IN_1_G, LOW); digitalWrite(IN_2_G, HIGH); 
+
+    ledcWrite(canalDroit, pwrDroit);
+    ledcWrite(canalGauche, pwrGauche);
+
+    // Debug toutes les 100ms
+    static uint32_t timer = 0;
+    if (millis() - timer > 100) {
+      Serial.printf("D:%ld G:%ld | Correction Gauche:%d\n", pasDroit, pasGauche, correction);
+      timer = millis();
+    }
+    ArduinoOTA.handle();
+    yield();
+  } 
+
+  ledcWrite(canalDroit, 0);
+  ledcWrite(canalGauche, 0);
+  Serial.println("Erreur système... Non mdr c juste le code est fini");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  pinMode(EN_D, OUTPUT); pinMode(EN_G, OUTPUT);
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  WiFi.softAP(ssid, password);
+  ArduinoOTA.begin();
+
+  ledcSetup(canalDroit, freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  digitalWrite(LEDU1, HIGH);
+}
+
+void loop() {
+  if (testEnCours) {
+  
+    LigneDroite(200, 200, 1500); 
+    delay(1000);
+
+    VirageDroite(90, 180, 800);
+    delay(1000);
+
+    LigneDroite(200, 200, 1500); 
+    delay(1000);
+
+    VirageDroite(90, 180, 800);
+    delay(1000);
+
+    LigneDroite(200, 200, 1500); 
+    delay(1000);
+
+    VirageDroite(90, 180, 800);
+    delay(1000);
+
+        LigneDroite(200, 200, 1500); 
+    delay(1000);
+
+    VirageDroite(90, 180, 800);
+    delay(1000);
+
+    testEnCours = false; 
+  }
+  ArduinoOTA.handle();
+}
