@@ -1,0 +1,54 @@
+void loop() {
+  if (testEnCours) {
+  
+    LigneDroite(200, 200, 500); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 1);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+    VirageArriereGauche(90, 180, 2);
+    delay(1000);
+
+    LigneDroite(200, 200, 3); 
+    delay(1000);
+
+
+
+    testEnCours = false; 
+  }
+  ArduinoOTA.handle();
+}
