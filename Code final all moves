@@ -10,6 +10,14 @@
 #define LEDU2 26
 
 // Enable moteurs droit et gauche
+// décident de la puissance envoyé au moteur: envoi une fréquence
+// si impulsion large, moteur recoit beaucoup d'énergie donc puissance élevé donc tourne vite
+// si impulsion courte, moteur recoit peu d'énergie donc peu de puissance donc tourne lentement
+// Lorsqu'on utilise la pin, on déclare 3 chose:
+//- la Fréquence: correspond à l'interrupteur de l'esp s'ouvre et se ferme 
+//- la Résolution: correspond au nombre de bit sur la quelle on découpe la puissance ( 8 bit = coupé en 256 positions )
+//- le rapport cyclique: c'est ce qu'on change pendnat que le robot roule, c'est le temps pendant lequel le courant reste allumé
+// si on met 200, on sera à 80% de puissance
 #define EN_D 23
 #define EN_G 4
 
@@ -21,37 +29,54 @@
 #define IN_1_G 17
 #define IN_2_G 16
 
-// --- ENCODEURS QUADRATURE ---
+// --- ENCODEURS QUADRATURE (RETROACTION) ---
+// Les encodeurs permettent de mesurer la rotation réelle de l'axe moteur.
+// Le modèle E1210GM possède un disque magnétique qui tourne devant deux capteurs à effet Hall.
+// - Voie A (CH_A) : Envoie des impulsions quand le moteur tourne. En comptant les fronts, on connaît la distance/vitesse.
+// - Voie B (CH_B) : Est décalée de 90° par rapport à la voie A. 
+//   - Si A change avant B, le moteur tourne dans un sens.
+//   - Si B change avant A, le moteur tourne dans l'autre sens.
 #define ENC_G_CH_A 32
 #define ENC_G_CH_B 33
 #define ENC_D_CH_A 27
 #define ENC_D_CH_B 14
 
 // I2C
+// - SDA (Serial Data) : La ligne qui transporte les bits de données.
+// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
 #define SDA 21
 #define SCL 22
 
 //Variable du Kd
+// Amortissement de la correction (Dérivé)
+//elle évite une correction trop brusque de la part du Kp
 long ecartPrecedent = 0; 
 float Kd = 0.8;
 
 //Variables du Kp
+// C'est la puissance de réaction immédiate. 
+//Plus l'écart entre la cible et la position actuelle est grand, plus Kp va pousser fort pour corriger l'erreur  
 float Kp = 1.5; 
 
 //Configuration Wifi
 const char* ssid = "Draw_GOAAAT";
 const char* password = "12345678";
-const int freq = 5000;
-const int resolution = 8;
+
+//Paramètres de bases défini
+const int freq = 5000; // fréquence de 5000 Hertz pour l'ESP32
+const int resolution = 8;//nombre de bits sur lequel est ciompté la puissance 
 const int canalDroit = 0;
 const int canalGauche = 1;
 
 volatile long pasDroit = 0;
 volatile long pasGauche = 0;
 
+//Fonctions d'interruptions
+// Fais en sorte que les ordres pour compter le nombre de pas des moteurs n'aillent pas dans le flash mais dans la RAM pour aller plus vite 
 void IRAM_ATTR ISR_Droit() { pasDroit++; }
 void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 
+//Se met en false pour arrêter le code une fois celui ci terminé
 bool testEnCours = true;
 
 //---------------------------------------------------------
@@ -417,8 +442,6 @@ void loop() {
   
     RotationDroite(200, 200, 500); 
     delay(1000);
-
-
 
     testEnCours = false; 
   }
