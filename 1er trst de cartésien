@@ -1,0 +1,243 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+// User led
+//pour savoir si la carte marche ou non 
+#define LEDU1 25
+#define LEDU2 26
+
+// Enable moteurs droit et gauche
+// décident de la puissance envoyé au moteur: envoi une fréquence
+// si impulsion large, moteur recoit beaucoup d'énergie donc puissance élevé donc tourne vite
+// si impulsion courte, moteur recoit peu d'énergie donc peu de puissance donc tourne lentement
+// Lorsqu'on utilise la pin, on déclare 3 chose:
+//- la Fréquence: correspond à l'interrupteur de l'esp s'ouvre et se ferme 
+//- la Résolution: correspond au nombre de bit sur la quelle on découpe la puissance ( 8 bit = coupé en 256 positions )
+//- le rapport cyclique: c'est ce qu'on change pendnat que le robot roule, c'est le temps pendant lequel le courant reste allumé
+// si on met 200, on sera à 80% de puissance
+#define EN_D 23
+#define EN_G 4
+
+// Commande PWM moteur droit
+#define IN_1_D 19
+#define IN_2_D 18
+
+// Commande PWM moteur gauche
+#define IN_1_G 17
+#define IN_2_G 16
+
+// --- ENCODEURS QUADRATURE (RETROACTION) ---
+// Les encodeurs permettent de mesurer la rotation réelle de l'axe moteur.
+// Le modèle E1210GM possède un disque magnétique qui tourne devant deux capteurs à effet Hall.
+// - Voie A (CH_A) : Envoie des impulsions quand le moteur tourne. En comptant les fronts, on connaît la distance/vitesse.
+// - Voie B (CH_B) : Est décalée de 90° par rapport à la voie A. 
+//   - Si A change avant B, le moteur tourne dans un sens.
+//   - Si B change avant A, le moteur tourne dans l'autre sens.
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// I2C
+// - SDA (Serial Data) : La ligne qui transporte les bits de données.
+// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
+#define SDA 21
+#define SCL 22
+
+//Variable du Kd
+// Amortissement de la correction (Dérivé)
+//elle évite une correction trop brusque de la part du Kp
+long ecartPrecedent = 0; 
+float Kd = 0.8;
+
+//Variables du Kp
+// C'est la puissance de réaction immédiate. 
+//Plus l'écart entre la cible et la position actuelle est grand, plus Kp va pousser fort pour corriger l'erreur  
+float Kp = 1.5; 
+
+//Configuration Wifi
+const char* ssid = "Draw_GOAAAT";
+const char* password = "12345678";
+
+//Paramètres de bases défini
+const int freq = 5000; // fréquence de 5000 Hertz pour l'ESP32
+const int resolution = 8;//nombre de bits sur lequel est ciompté la puissance 
+const int canalDroit = 0;
+const int canalGauche = 1;
+
+volatile long pasDroit = 0;
+volatile long pasGauche = 0;
+
+//Fonctions d'interruptions
+// Fais en sorte que les ordres pour compter le nombre de pas des moteurs n'aillent pas dans le flash mais dans la RAM pour aller plus vite 
+void IRAM_ATTR ISR_Droit() { pasDroit++; }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+//Se met en false pour arrêter le code une fois celui ci terminé
+bool testEnCours = true;
+
+//Valeurs physiques du robot pour ne pas les oubliés
+const float cm_par_ticks = 0.03;  // 30cm / 1000 ticks
+const float entraxe = 6.62;       // c'est la dimension de la plateforme principale du robot où repose les moteurs
+const float Offset_stylo = 12.0;
+const float mi_entrax= 3.31;            // Offset stylo 12cm, c'est de combien de cm le stylo il est avancé en ligne droite par rapport au centre des deux roues
+
+//Valuers pour lier le plan polaire de la base du robot au plan cartésien du stylo
+//on fait donc juste de la trigo sur un triangle rectangle classique
+//on sait donc grâce à ca le décalage entre une des roue et le stylo
+const float angle_tan_base_stylo_droite = atan2( Offset_stylo, mi_entrax); // si on considère que l'anngle positif est pour la roue droite
+const float angle_tan_base_stylo_gauche=atan2(Offset_stylo, (-1)*mi_entrax);//alors l'angle pour la roue gauche est négatif
+
+//Maintenant on va  définir les points que devra suivre le robot en ligne droite entre les points
+float mesPoints[][2] = { {20.0, 0.0}, {20.0, 20.0}, {0.0, 20.0}, {0.0, 0.0} }; 
+float pointActuel[2] = {0.0, 0.0};//c'est la position de base dans leplan cartésien du stylo
+const int nbPoints = 4;
+float angle_Robot_actuel = 0;
+
+//ici on créé la constante de conversion du plan du stylo vers le plan polaire du chassis
+// Distance réelle entre une roue et la pointe du stylo, ca correspond à l'hypothénus du triangle 
+const float dist_roue_stylo = sqrt(sq(Offset_stylo) + sq(mi_entrax));
+// là c'est la même chose mais en coordonnées cartésiennes
+const float roue_D_rel[2] = {-12.0,  3.31}; // Roue Droite est derrière (-12) et à droite (+3.31)
+const float roue_G_rel[2] = {-12.0, -3.31}; // Roue Gauche est derrière (-12) et à gauche (-3.31)
+
+void Rotation_sur_stylo(float angleVouluRad) {
+    if (abs(angleVouluRad) < 0.05) return;
+
+    float distanceArc = angleVouluRad * dist_roue_stylo;
+    long ticksRotation = abs(distanceArc / cm_par_ticks);
+
+    pasDroit = 0; pasGauche = 0;
+    
+    // --- LA LOGIQUE DU PIVOT SUR STYLO ---
+    // Pour que le stylo reste fixe et que le robot tourne autour :
+    // Les deux roues doivent aller dans le MÊME SENS (Avant ou Arrière)
+    
+    if (angleVouluRad > 0) {
+        // Rotation GAUCHE : Le robot doit se déplacer vers la DROITE pour que le stylo pivote à gauche
+        // On fait avancer les deux moteurs (selon tes branchements IN1/IN2)
+        digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+        digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+    } else {
+        // Rotation DROITE : Le robot doit se déplacer vers la GAUCHE
+        // On fait reculer les deux moteurs
+        digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW); 
+        digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); 
+    }
+
+    // Boucle de contrôle
+    while (abs(pasDroit) < ticksRotation) {
+        // On essaie de garder les deux roues synchronisées pour décrire l'arc
+        long ecart = abs(pasGauche) - abs(pasDroit);
+        int correction = ecart * Kp;
+
+        ledcWrite(canalDroit, 150); 
+        ledcWrite(canalGauche, constrain(150 - correction, 0, 255));
+        
+        yield();
+    }
+    
+    ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+    delay(300);
+}
+
+void avancerLigneDroite(float distanceCm) {
+    long ticksAfaire = distanceCm / cm_par_ticks;
+    pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
+
+    // Sens Avant (selon tes branchements)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
+
+    while (pasDroit < ticksAfaire) {
+        long ecart = pasGauche - pasDroit;
+        float derivee = ecart - ecartPrecedent;
+        int correction = (ecart * Kp) + (derivee * Kd);
+        ecartPrecedent = ecart;
+
+        ledcWrite(canalDroit, 200); // On met un peu plus de puissance pour les lignes droites
+        ledcWrite(canalGauche, constrain(200 - correction, 0, 255));
+
+        ArduinoOTA.handle();
+        yield();
+    }
+    // Stop net
+    ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+    delay(200); // Petite pause pour stabiliser le stylo
+}
+
+//Là c'est la fonction test pour voir si on arrive à dessiner le carré
+// On garde un seul paramètre : l'angle de départ
+void dessinerCarre(float angle_depart) {
+    // Initialisation de l'angle local au début du dessin
+    angle_Robot_actuel = angle_depart;
+
+    for (int i = 0; i < nbPoints; i++) {
+        float cibleX = mesPoints[i][0];
+        float cibleY = mesPoints[i][1];
+
+        // Étape A : Calcul du vecteur vers la cible
+        float dx = cibleX - pointActuel[0];
+        float dy = cibleY - pointActuel[1];
+        
+        float angleCible = atan2(dy, dx);
+        float distance = sqrt(dx*dx + dy*dy);
+
+        // Étape B : Pivot sur le stylo
+        float rotationNecessaire = angleCible - angle_Robot_actuel;
+        
+        // Normalisation de l'angle (pour prendre le chemin le plus court)
+        while (rotationNecessaire > PI)  rotationNecessaire -= 2 * PI;
+        while (rotationNecessaire < -PI) rotationNecessaire += 2 * PI;
+
+        Rotation_sur_stylo(rotationNecessaire);
+        angle_Robot_actuel = angleCible; 
+
+        // Étape C : Avance
+        avancerLigneDroite(distance);
+
+        // Mise à jour de la mémoire de position
+        pointActuel[0] = cibleX;
+        pointActuel[1] = cibleY;
+        
+        Serial.printf("Point atteint : X=%.2f, Y=%.2f\n", pointActuel[0], pointActuel[1]);
+    }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Configuration des sorties moteurs
+  pinMode(EN_D, OUTPUT); pinMode(EN_G, OUTPUT);
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  // Configuration PWM ESP32
+  ledcSetup(canalDroit, freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+
+  // Configuration Encodeurs + Interruptions
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  // WiFi et OTA (optionnel mais pratique)
+  WiFi.softAP(ssid, password);
+  ArduinoOTA.begin();
+}
+
+void loop() {
+  ArduinoOTA.handle();
+
+  if (testEnCours) {
+    dessinerCarre(0); // On commence avec un angle de 0 (face à l'axe X)
+    testEnCours = false;
+    Serial.println("Carré terminé !");
+  }
+}
