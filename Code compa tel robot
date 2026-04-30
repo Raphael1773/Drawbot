@@ -1,0 +1,184 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+// --- PINS MOTEURS ---
+#define EN_D    23
+#define EN_G    4
+#define IN_1_D  19
+#define IN_2_D  18
+#define IN_1_G  17
+#define IN_2_G  16
+
+const int freq       = 5000;
+const int resolution = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// --- I2C ---
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// --- ADRESSES ---
+#define LIS3MDL_ADDR  0x1E
+
+// --- REGISTRES LIS3MDL ---
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+// =============================================
+// VARIABLES CALIBRAGE HARD-IRON
+// =============================================
+int16_t mx_min =  32767, mx_max = -32768;
+int16_t my_min =  32767, my_max = -32768;
+
+// =============================================
+// UTILITAIRES I2C
+// =============================================
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg | 0x80);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int16_t)(hi << 8 | lo);
+}
+
+// =============================================
+// INIT
+// =============================================
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+}
+
+void initMoteurs() {
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+}
+
+void demarrerRotation() {
+  digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+  digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+  ledcWrite(canalDroit,  200);
+  ledcWrite(canalGauche, 200);
+}
+
+void arreterMoteurs() {
+  ledcWrite(canalDroit,  0);
+  ledcWrite(canalGauche, 0);
+}
+
+// =============================================
+// CALCUL CAP AVEC CORRECTION HARD-IRON
+// =============================================
+float calculerCap(int16_t mx, int16_t my) {
+  // Soustraction des offsets hard-iron
+  float cx = mx - (mx_min + mx_max) / 2.0;
+  float cy = my - (my_min + my_max) / 2.0;
+
+  float cap = atan2(cy, cx) * 180.0 / PI;
+  if (cap < 0) cap += 360.0;
+  return cap;
+}
+
+// =============================================
+// SETUP
+// =============================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  initMoteurs();
+  initLIS3MDL();
+
+  // --------------------------------------------------
+  // PHASE 1 : Collecte min/max sur 360° (hard-iron)
+  // --------------------------------------------------
+  Serial.println("=== PHASE 1 : CALIBRAGE HARD-IRON ===");
+  Serial.println("Le robot va tourner sur lui-même pendant 8 secondes");
+  Serial.println("Démarre dans 3 secondes...");
+  delay(3000);
+
+  demarrerRotation();
+
+  uint32_t debut = millis();
+  while (millis() - debut < 8000) {
+    int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+    int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+
+    // Collecte des min/max
+    if (mx < mx_min) mx_min = mx;
+    if (mx > mx_max) mx_max = mx;
+    if (my < my_min) my_min = my;
+    if (my > my_max) my_max = my;
+
+    // Téléplot pour voir la collecte en direct
+    Serial.printf(">mag_x_brut:%d\n", mx);
+    Serial.printf(">mag_y_brut:%d\n", my);
+
+    delay(50);
+  }
+
+  arreterMoteurs();
+
+  // Affichage des offsets calculés
+  float offset_x = (mx_min + mx_max) / 2.0;
+  float offset_y = (my_min + my_max) / 2.0;
+
+  Serial.println("\n=== RÉSULTATS CALIBRAGE ===");
+  Serial.printf("MX min:%d  max:%d  offset:%.1f\n", mx_min, mx_max, offset_x);
+  Serial.printf("MY min:%d  max:%d  offset:%.1f\n", my_min, my_max, offset_y);
+  Serial.println("===========================\n");
+
+  // --------------------------------------------------
+  // PHASE 2 : Comparaison cap ESP32 vs smartphone
+  // --------------------------------------------------
+  Serial.println("=== PHASE 2 : COMPARAISON AVEC SMARTPHONE ===");
+  Serial.println("Pose le robot face à 0° (Nord) selon ton smartphone");
+  Serial.println("Note le cap affiché par l'ESP32 et compare");
+  Serial.println("Tourne par paliers de 45° et note les valeurs\n");
+  Serial.println("Cap_ESP(°) affiché en continu dans Teleplot...");
+  delay(2000);
+}
+
+// =============================================
+// LOOP : cap en temps réel + comparaison
+// =============================================
+void loop() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+
+  float cap = calculerCap(mx, my);
+
+  // Téléplot
+  Serial.printf(">cap_esp:%.1f\n", cap);
+
+  // Serial Monitor aussi pour noter les valeurs
+  static uint32_t timer = 0;
+  if (millis() - timer > 500) {
+    Serial.printf("Cap ESP32 : %.1f°  →  Note le cap de ton smartphone ici\n", cap);
+    timer = millis();
+  }
+
+  delay(50);
+}
