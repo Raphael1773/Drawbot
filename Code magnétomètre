@@ -1,0 +1,182 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+// --- PINS MOTEURS ---
+#define EN_D    23
+#define EN_G    4
+#define IN_1_D  19
+#define IN_2_D  18
+#define IN_1_G  17
+#define IN_2_G  16
+
+const int freq       = 5000;
+const int resolution = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// --- I2C ---
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// --- ADRESSES ---
+#define LSM6DS3_ADDR  0x6B
+#define LIS3MDL_ADDR  0x1E
+
+// --- REGISTRES LIS3MDL ---
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+// --- REGISTRES LSM6DS3 ---
+#define LSM6_CTRL1_XL  0x10
+#define LSM6_CTRL2_G   0x11
+#define LSM6_OUTX_L_G  0x22
+
+// =============================================
+// UTILITAIRES I2C
+// =============================================
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg | 0x80);
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int16_t)(hi << 8 | lo);
+}
+
+// =============================================
+// SCANNER I2C
+// =============================================
+void scannerI2C() {
+  Serial.println("\n=== SCAN I2C ===");
+  int nbTrouves = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("Appareil trouvé à : 0x%02X", addr);
+      if (addr == 0x6A) Serial.print("  ← LSM6DS3 (IMU)");
+      if (addr == 0x6B) Serial.print("  ← LSM6DS3 (IMU) adresse alternative");
+      if (addr == 0x1C) Serial.print("  ← LIS3MDL (Magnéto)");
+      if (addr == 0x1E) Serial.print("  ← LIS3MDL (Magnéto) adresse alternative");
+      Serial.println();
+      nbTrouves++;
+    }
+  }
+  if (nbTrouves == 0) {
+    Serial.println("Aucun appareil trouvé !");
+    Serial.println("→ Vérifie SDA pin 21 et SCL pin 22");
+    Serial.println("→ Vérifie l'alimentation 3.3V des capteurs");
+  }
+  Serial.println("=== FIN SCAN ===\n");
+}
+
+// =============================================
+// INIT CAPTEURS
+// =============================================
+void initLSM6DS3() {
+  writeReg(LSM6DS3_ADDR, LSM6_CTRL1_XL, 0x40);
+  writeReg(LSM6DS3_ADDR, LSM6_CTRL2_G,  0x40);
+  Serial.println("LSM6DS3 initialisé");
+}
+
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+  Serial.println("LIS3MDL initialisé");
+}
+
+// =============================================
+// INIT MOTEURS
+// =============================================
+void initMoteurs() {
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+}
+
+void demarrerRotation() {
+  digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+  digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+  ledcWrite(canalDroit,  200);
+  ledcWrite(canalGauche, 200);
+}
+
+void arreterMoteurs() {
+  ledcWrite(canalDroit,  0);
+  ledcWrite(canalGauche, 0);
+}
+
+// =============================================
+// SETUP
+// =============================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  // Scanner en premier pour voir ce qui répond
+  scannerI2C();
+
+  initMoteurs();
+  initLSM6DS3();
+  initLIS3MDL();
+
+  Serial.println("=== VERIFICATION MAGNETO ===");
+  Serial.println("Le robot va tourner 5 secondes");
+  Serial.println("Démarre dans 3 secondes...");
+  delay(3000);
+
+  demarrerRotation();
+
+  uint32_t debut = millis();
+  while (millis() - debut < 5000) {
+    int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+    int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+    int16_t mz = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 4);
+
+    Serial.printf(">mag_x:%d\n", mx);
+    Serial.printf(">mag_y:%d\n", my);
+    Serial.printf(">mag_z:%d\n", mz);
+
+    delay(50);
+  }
+
+  arreterMoteurs();
+  Serial.println("=== FIN VERIFICATION ===");
+}
+
+// =============================================
+// LOOP
+// =============================================
+void loop() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+  int16_t mz = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 4);
+
+  int16_t gz = read16(LSM6DS3_ADDR, LSM6_OUTX_L_G + 4);
+  float gz_dps = gz * 0.00875;
+
+  Serial.printf(">mag_x:%d\n", mx);
+  Serial.printf(">mag_y:%d\n", my);
+  Serial.printf(">mag_z:%d\n", mz);
+  Serial.printf(">gyro_z:%.2f\n", gz_dps);
+
+  delay(50);
+}
