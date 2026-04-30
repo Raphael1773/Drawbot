@@ -1,0 +1,107 @@
+#include <Arduino.h>
+#include <esp_task_wdt.h>
+
+// --- PINS (identiques à ton projet) ---
+#define EN_D    23
+#define EN_G    4
+#define IN_1_D  19
+#define IN_2_D  18
+#define IN_1_G  17
+#define IN_2_G  16
+
+#define ENC_D_CH_A 27
+#define ENC_G_CH_A 32
+
+const int freq       = 5000;
+const int resolution = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+// Paliers de consigne à tester
+int paliers[] = {200, 210, 220, 230, 240, 250, 255};
+int nbPaliers = 7;
+
+// Durée de mesure par palier (ms)
+const int DUREE_PALIER = 2000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Moteur droit
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  // Moteur gauche
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  ledcSetup(canalDroit,  freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  // Sens AVANT pour les deux moteurs
+  digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+  digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+
+  Serial.println("=== CALIBRAGE ACTIONNEURS ===");
+  Serial.println("PWM | Ticks_D | Ticks_G | Vitesse_D (t/s) | Vitesse_G (t/s)");
+
+  for (int i = 0; i < nbPaliers; i++) {
+    int pwm = paliers[i];
+
+    // Appliquer le palier
+    ledcWrite(canalDroit,  pwm);
+    ledcWrite(canalGauche, pwm);
+
+    // Laisser le moteur se stabiliser
+    delay(300);
+
+    // Remettre les compteurs à zéro
+    noInterrupts();
+    pasDroit  = 0;
+    pasGauche = 0;
+    interrupts();
+
+    uint32_t debut = millis();
+
+    // Attendre la durée du palier
+    while (millis() - debut < DUREE_PALIER) {
+      esp_task_wdt_reset();
+      vTaskDelay(1);
+    }
+
+    // Lire les compteurs
+    noInterrupts();
+    long ticksD = pasDroit;
+    long ticksG = pasGauche;
+    interrupts();
+
+    // Calculer la vitesse en ticks/seconde
+    float vitD = (float)ticksD / (DUREE_PALIER / 1000.0);
+    float vitG = (float)ticksG / (DUREE_PALIER / 1000.0);
+
+    // Afficher dans le Serial Plotter OU Serial Monitor
+Serial.printf(">vitesse_droite:%.1f\n", vitD);
+Serial.printf(">vitesse_gauche:%.1f\n", vitG);
+Serial.printf(">consigne_pwm:%d\n", pwm);
+  }
+
+  // Arrêt moteurs
+  ledcWrite(canalDroit,  0);
+  ledcWrite(canalGauche, 0);
+  Serial.println("=== FIN CALIBRAGE ===");
+}
+
+void loop() {
+  // Rien, calibrage fait une seule fois dans setup()
+}
