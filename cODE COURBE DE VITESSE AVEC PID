@@ -1,0 +1,126 @@
+#include <Arduino.h>
+#include <esp_task_wdt.h>
+
+#define EN_D    23
+#define EN_G    4
+#define IN_1_D  19
+#define IN_2_D  18
+#define IN_1_G  17
+#define IN_2_G  16
+#define ENC_D_CH_A 27
+#define ENC_G_CH_A 32
+
+const int freq       = 5000;
+const int resolution = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// --- TON PD ---
+float Kp = 1.5;
+float Kd = 0.8;
+long ecartPrecedent = 0;
+
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+int paliers[] = {200, 210, 220, 230, 240, 250, 255};
+int nbPaliers = 7;
+const int DUREE_PALIER = 2000;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  ledcSetup(canalDroit,  freq, resolution);
+  ledcSetup(canalGauche, freq, resolution);
+  ledcAttachPin(EN_D, canalDroit);
+  ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+  digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+
+  Serial.println("=== CALIBRAGE AVEC PD ===");
+
+  for (int i = 0; i < nbPaliers; i++) {
+    int pwm = paliers[i];
+
+    // Reset compteurs et PD
+    noInterrupts();
+    pasDroit  = 0;
+    pasGauche = 0;
+    interrupts();
+    ecartPrecedent = 0;
+
+    // Déclarés ici = remis à 0 à chaque palier
+    long lastD = 0, lastG = 0;
+    uint32_t timerPlot = 0;
+
+    // Appliquer le palier et laisser stabiliser
+    ledcWrite(canalDroit,  pwm);
+    ledcWrite(canalGauche, pwm);
+    delay(300);
+
+    // Reset après stabilisation
+    noInterrupts();
+    pasDroit  = 0;
+    pasGauche = 0;
+    interrupts();
+    ecartPrecedent = 0;
+    lastD = 0;
+    lastG = 0;
+
+    uint32_t debut = millis();
+
+    while (millis() - debut < DUREE_PALIER) {
+
+      // --- PD ---
+      long ecart = pasGauche - pasDroit;
+      float derivee = ecart - ecartPrecedent;
+      int correction = (ecart * Kp) + (derivee * Kd);
+      ecartPrecedent = ecart;
+
+      int pwrGauche = constrain(pwm - correction, 0, 255);
+
+      ledcWrite(canalDroit,  pwm);
+      ledcWrite(canalGauche, pwrGauche);
+
+      // Envoi Teleplot toutes les 100ms
+      if (millis() - timerPlot > 100) {
+
+        float vitD_inst = (pasDroit  - lastD) * 10.0;
+        float vitG_inst = (pasGauche - lastG) * 10.0;
+        lastD = pasDroit;
+        lastG = pasGauche;
+
+        Serial.printf(">vitesse_droite:%.1f\n",  vitD_inst);
+        Serial.printf(">vitesse_gauche:%.1f\n",  vitG_inst);
+        Serial.printf(">consigne_pwm:%d\n",       pwm);
+        Serial.printf(">correction_pd:%d\n",      correction);
+        Serial.printf(">pwm_gauche_corrige:%d\n", pwrGauche);
+
+        timerPlot = millis();
+      }
+
+      esp_task_wdt_reset();
+      vTaskDelay(1);
+    }
+  }
+
+  // Arrêt moteurs
+  ledcWrite(canalDroit,  0);
+  ledcWrite(canalGauche, 0);
+  Serial.println("=== FIN CALIBRAGE ===");
+}
+
+void loop() {}
