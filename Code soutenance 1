@@ -1,0 +1,661 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+// ───────────────────────────────────────────────
+// LEDs utilisateur
+// LED1 : carte alimentée et code actif
+// LED2 : commande moteur en cours
+// ───────────────────────────────────────────────
+#define LEDU1 25
+#define LEDU2 26
+
+// ───────────────────────────────────────────────
+// Enable moteurs droit et gauche (signal PWM)
+// La largeur d'impulsion détermine la puissance :
+//   large → beaucoup d'énergie → tourne vite
+//   courte → peu d'énergie    → tourne lentement
+// ───────────────────────────────────────────────
+#define EN_D 23
+#define EN_G  4
+
+// ───────────────────────────────────────────────
+// Pins de direction moteur droit
+// IN1=LOW  / IN2=HIGH → sens avant
+// IN1=HIGH / IN2=LOW  → sens arrière
+// ───────────────────────────────────────────────
+#define IN_1_D 19
+#define IN_2_D 18
+
+// ───────────────────────────────────────────────
+// Pins de direction moteur gauche
+// IN1=HIGH / IN2=LOW  → sens avant
+// IN1=LOW  / IN2=HIGH → sens arrière
+// ───────────────────────────────────────────────
+#define IN_1_G 17
+#define IN_2_G 16
+
+// ───────────────────────────────────────────────
+// Encodeurs quadrature — voie A uniquement
+// Chaque front montant sur CH_A = 1 tick
+// 1050 ticks = 1 tour complet de roue (70mm diam.)
+//
+// volatile  : le compilateur ne met jamais ces
+//   variables en cache — elles peuvent changer
+//   à tout moment via une interruption
+// IRAM_ATTR : force les ISR en RAM plutôt qu'en
+//   flash → exécution plus rapide, aucun tick manqué
+// ───────────────────────────────────────────────
+#define ENC_D_CH_A 27
+#define ENC_G_CH_A 32
+
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+// ───────────────────────────────────────────────
+// I2C — communication avec le magnétomètre
+// SDA (pin 21) : ligne de données bit par bit
+// SCL (pin 22) : horloge qui synchronise l'envoi
+// ───────────────────────────────────────────────
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ───────────────────────────────────────────────
+// Magnétomètre LIS3MDL
+// Adresse I2C : 0x1E
+// OUT_X_L : premier registre de sortie (LSB de X)
+//   Les 6 octets suivants : X_L X_H Y_L Y_H Z_L Z_H
+// ───────────────────────────────────────────────
+#define LIS3MDL_ADDR 0x1E
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+// ───────────────────────────────────────────────
+// PARAMÈTRES PWM
+// freq       : 5000 Hz
+// resolution : 8 bits → 256 niveaux (0 à 255)
+// canal 0    → moteur droit
+// canal 1    → moteur gauche
+// ───────────────────────────────────────────────
+const int freq        = 5000;
+const int resolution  = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// ───────────────────────────────────────────────
+// COMPENSATION DE VITESSE MOTEURS
+//
+// Les moteurs n'ont pas exactement la même vitesse
+// à puissance identique, et ce déséquilibre est
+// différent en avant et en arrière (frottements
+// et couple moteur asymétriques selon le sens).
+//
+// Mesuré en marche AVANT (même distance) :
+//   Gauche : 36632 ticks / Droite : 36089 ticks
+//   → Gauche 1.5% trop rapide
+//   → PWR_GAUCHE_AV = 200 × (36089/36632) ≈ 197
+//
+// Mesuré en marche ARRIÈRE (même distance) :
+//   Droite : 2071 ticks / Gauche : 1943 ticks
+//   → Droite 6.2% trop rapide
+//   → PWR_DROIT_AR = 200 × (1943/2071) ≈ 188
+//
+// PWR_FAIBLE : puissance réduite pour la roue
+//   intérieure lors des virages
+// ───────────────────────────────────────────────
+const int PWR_DROIT_AV  = 200;   // avant   — référence
+const int PWR_GAUCHE_AV = 197;   // avant   — gauche 1.5% trop rapide
+const int PWR_DROIT_AR  = 183;   // arrière — référence
+const int PWR_GAUCHE_AR = 200;   // arrière — gauche 3.6% trop rapide
+const int PWR_FAIBLE    = 100;   // roue intérieure des virages
+
+// ───────────────────────────────────────────────
+// WIFI
+// L'ESP32 crée son propre réseau WiFi
+// → connecte ton téléphone/PC à "Draw_GOAAAT"
+// → ouvre 192.168.4.1 dans le navigateur
+// → pour le Serial Monitor PlatformIO :
+//   monitor_port = socket://192.168.4.1:23
+// ───────────────────────────────────────────────
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+// ───────────────────────────────────────────────
+// SERVEUR TELNET (port 23)
+// Remplace le câble USB pour le Serial Monitor.
+// Permet de voir les logs sans fil, notamment
+// pendant la calibration magnétomètre.
+//
+// WiFiServer  : écoute les connexions entrantes
+// WiFiClient  : représente le PC connecté
+// ───────────────────────────────────────────────
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+
+// Serveur HTTP (port 80) : sert la page HTML du GUI
+WebServer server(80);
+
+// ───────────────────────────────────────────────
+// Commande active : détermine ce que font les
+// moteurs dans le loop(). Vaut "stop" par défaut.
+// ───────────────────────────────────────────────
+String commandeEnCours = "stop";
+
+// ───────────────────────────────────────────────
+// CALIBRATION MAGNÉTOMÈTRE — valeurs mesurées
+//
+// Ces valeurs ont été obtenues en faisant tourner
+// le robot sur lui-même à 360° sans câble USB.
+// Le magnétomètre décrit une ellipse dans le plan
+// X/Y. On mesure ses extrêmes pour calculer :
+//
+//   xOffset/yOffset : centre de l'ellipse
+//     → compense le hard iron (champ parasite fixe
+//       créé par les moteurs, vis, etc.)
+//
+//   xScale/yScale : rayon de l'ellipse sur chaque axe
+//     → compense le soft iron (déformation du champ
+//       par les matériaux proches du capteur)
+//
+// Formule de correction (appliquée dans handleMagRaw) :
+//   nx  = (mx - xOffset) / xScale   → entre -1 et +1
+//   ny  = (my - yOffset) / yScale   → entre -1 et +1
+//   cap = atan2(-ny, nx) × 180/π    → 0° à 360°
+//
+// Résultat de calibration obtenu :
+//   Ratio X/Y = 1.01 → quasi cercle parfait ✓
+// ───────────────────────────────────────────────
+const float CALIB_X_OFFSET = -1833.5;
+const float CALIB_Y_OFFSET =   753.5;
+const float CALIB_X_SCALE  =  1691.5;
+const float CALIB_Y_SCALE  =  1710.5;
+
+
+// ═══════════════════════════════════════════════
+// FONCTION DE LOG — remplace Serial.printf()
+//
+// Envoie le message à la fois :
+//   - sur le port série USB (si câble branché)
+//   - au client Telnet connecté en WiFi
+//
+// Usage identique à Serial.printf :
+//   logf("Cap : %d degres\n", cap);
+// ═══════════════════════════════════════════════
+void logf(const char* format, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  Serial.print(buf);
+  if (telnetClient && telnetClient.connected())
+    telnetClient.print(buf);
+}
+
+// ═══════════════════════════════════════════════
+// GESTION TELNET — à appeler dans le loop()
+//
+// Vérifie si un nouveau client veut se connecter.
+// Si un ancien client est déjà là, on le déconnecte
+// pour accepter la nouvelle connexion.
+// ═══════════════════════════════════════════════
+void checkTelnet() {
+  if (telnetServer.hasClient()) {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+    telnetClient = telnetServer.available();
+  }
+}
+
+
+// ═══════════════════════════════════════════════
+// UTILITAIRES I2C
+// writeReg : écrit un octet dans un registre
+// read16   : lit 2 octets consécutifs little-endian
+//   (LSB en premier, MSB en second)
+// ═══════════════════════════════════════════════
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg | 0x80);   // bit 7 à 1 → auto-incrément d'adresse
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int16_t)(hi << 8 | lo);
+}
+
+// ═══════════════════════════════════════════════
+// INIT MAGNÉTOMÈTRE LIS3MDL
+// CTRL1 0x70 : ultra-haute performance XY, ODR 10Hz
+// CTRL2 0x00 : pleine échelle ±4 gauss
+// CTRL3 0x00 : mode de mesure continu
+// CTRL4 0x0C : ultra-haute performance Z
+// ═══════════════════════════════════════════════
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+  logf("LIS3MDL initialise\n");
+}
+
+
+// ═══════════════════════════════════════════════
+// PAGE HTML DU GUI
+// Stockée en flash (PROGMEM) pour économiser la RAM.
+// Contient :
+//   - boutons de direction
+//   - bloc magnétomètre brut X Y Z
+//   - bloc ticks encodeurs + bouton reset
+// ═══════════════════════════════════════════════
+const char PAGE_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Draw_GOAAAT</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: #111; color: #fff; font-family: sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; min-height: 100vh;
+      gap: 16px; padding: 20px;
+      touch-action: none; user-select: none;
+    }
+    h1 { font-size: 1.4rem; letter-spacing: 2px; color: #0af; }
+    #status { font-size: 0.85rem; color: #888; height: 20px; transition: color 0.2s; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 90px);
+      grid-template-rows: repeat(3, 90px);
+      gap: 10px;
+    }
+    .btn {
+      background: #222; border: 2px solid #444; border-radius: 14px;
+      color: #fff; font-size: 2rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.1s, border-color 0.1s, transform 0.1s;
+      -webkit-user-select: none;
+    }
+    .btn:active, .btn.pressed { background: #0af; border-color: #0af; color: #000; transform: scale(0.93); }
+    .btn.danger:active, .btn.danger.pressed { background: #f44; border-color: #f44; }
+    #btn-vag  { grid-column: 1; grid-row: 1; }
+    #btn-av   { grid-column: 2; grid-row: 1; }
+    #btn-vad  { grid-column: 3; grid-row: 1; }
+    #btn-rg   { grid-column: 1; grid-row: 2; }
+    #btn-stop { grid-column: 2; grid-row: 2; }
+    #btn-rd   { grid-column: 3; grid-row: 2; }
+    #btn-veg  { grid-column: 1; grid-row: 3; }
+    #btn-re   { grid-column: 2; grid-row: 3; }
+    #btn-ved  { grid-column: 3; grid-row: 3; }
+    .data-box {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 16px;
+      padding: 14px 24px; display: flex; flex-direction: column;
+      gap: 10px; width: 290px;
+    }
+    .data-box h2 { font-size: 0.9rem; letter-spacing: 1px; }
+    .data-box h2.vert { color: #0f8; }
+    .data-box h2.bleu { color: #0af; }
+    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+    .data-label { font-size: 0.78rem; color: #888; align-self: center; }
+    .data-val { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
+    .data-val.x { color: #f66; }
+    .data-val.y { color: #6f6; }
+    .data-val.z { color: #66f; }
+    .data-val.droite { color: #0af; }
+    .data-val.gauche { color: #fa0; }
+    #btn-reset-ticks {
+      background: #222; border: 1px solid #555; border-radius: 8px;
+      color: #aaa; font-size: 0.75rem; padding: 5px 12px;
+      cursor: pointer; align-self: center;
+    }
+    #btn-reset-ticks:active { background: #555; color: #fff; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Draw_GOAAAT</h1>
+  <div id="status">En attente...</div>
+
+  <div class="grid">
+    <div class="btn" id="btn-vag"  data-cmd="vag">↖</div>
+    <div class="btn" id="btn-av"   data-cmd="avancer">⬆</div>
+    <div class="btn" id="btn-vad"  data-cmd="vad">↗</div>
+    <div class="btn" id="btn-rg"   data-cmd="rotation_gauche">↺</div>
+    <div class="btn danger" id="btn-stop" data-cmd="stop">■</div>
+    <div class="btn" id="btn-rd"   data-cmd="rotation_droite">↻</div>
+    <div class="btn" id="btn-veg"  data-cmd="veg">↙</div>
+    <div class="btn" id="btn-re"   data-cmd="reculer">⬇</div>
+    <div class="btn" id="btn-ved"  data-cmd="ved">↘</div>
+  </div>
+
+  <!-- ── BLOC MAGNÉTOMÈTRE BRUT ──────────────────────────
+       Valeurs brutes en LSB sur les 3 axes.
+       Mis à jour toutes les 200 ms via /mag/raw
+  ──────────────────────────────────────────────────────── -->
+  <div class="data-box">
+    <h2 class="vert">📡 MAGNÉTOMÈTRE BRUT</h2>
+    <div class="data-grid">
+      <span class="data-label">Axe X (LSB)</span>
+      <span class="data-val x" id="mag-x">—</span>
+      <span class="data-label">Axe Y (LSB)</span>
+      <span class="data-val y" id="mag-y">—</span>
+      <span class="data-label">Axe Z (LSB)</span>
+      <span class="data-val z" id="mag-z">—</span>
+    </div>
+  </div>
+
+  <!-- ── BLOC TICKS ENCODEURS ────────────────────────────
+       Fronts montants comptés depuis le dernier reset.
+       1050 ticks = 1 tour de roue complet.
+       Mis à jour toutes les 200 ms via /ticks
+  ──────────────────────────────────────────────────────── -->
+  <div class="data-box">
+    <h2 class="bleu">🔢 TICKS ENCODEURS</h2>
+    <div class="data-grid">
+      <span class="data-label">Roue droite</span>
+      <span class="data-val droite" id="tick-d">—</span>
+      <span class="data-label">Roue gauche</span>
+      <span class="data-val gauche" id="tick-g">—</span>
+    </div>
+    <button id="btn-reset-ticks">↺ Remettre à zéro</button>
+  </div>
+
+  <script>
+    const status = document.getElementById('status');
+    const labels = {
+      avancer:         '⬆ Avance',
+      reculer:         '⬇ Recule',
+      vag:             '↖ Virage avant gauche',
+      vad:             '↗ Virage avant droite',
+      veg:             '↙ Virage arrière gauche',
+      ved:             '↘ Virage arrière droite',
+      rotation_gauche: '↺ Rotation gauche',
+      rotation_droite: '↻ Rotation droite',
+      stop:            '■ Arrêt'
+    };
+    function send(cmd) {
+      fetch('/cmd?action=' + cmd).catch(() => {});
+      status.textContent = labels[cmd] || cmd;
+      status.style.color = cmd === 'stop' ? '#888' : '#0af';
+    }
+    document.querySelectorAll('.btn').forEach(btn => {
+      const cmd = btn.dataset.cmd;
+      btn.addEventListener('mousedown',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); });
+      btn.addEventListener('mouseup',    () => { btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+      btn.addEventListener('mouseleave', () => { if (btn.classList.contains('pressed')) { btn.classList.remove('pressed'); send('stop'); } });
+      btn.addEventListener('touchstart',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); }, { passive: false });
+      btn.addEventListener('touchend',    e => { e.preventDefault(); btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+      btn.addEventListener('touchcancel', () => { btn.classList.remove('pressed'); send('stop'); });
+    });
+
+    async function fetchMagBrut() {
+      try {
+        const r = await fetch('/mag/raw');
+        const d = await r.json();
+        document.getElementById('mag-x').textContent = d.mx;
+        document.getElementById('mag-y').textContent = d.my;
+        document.getElementById('mag-z').textContent = d.mz;
+      } catch(e) {}
+    }
+    setInterval(fetchMagBrut, 200);
+    fetchMagBrut();
+
+    async function fetchTicks() {
+      try {
+        const r = await fetch('/ticks');
+        const d = await r.json();
+        document.getElementById('tick-d').textContent = d.droite;
+        document.getElementById('tick-g').textContent = d.gauche;
+      } catch(e) {}
+    }
+    setInterval(fetchTicks, 200);
+    fetchTicks();
+
+    document.getElementById('btn-reset-ticks').addEventListener('click', async () => {
+      await fetch('/ticks/reset');
+      fetchTicks();
+    });
+  </script>
+</body>
+</html>
+)rawhtml";
+
+
+// ═══════════════════════════════════════════════
+// APPLIQUE LA COMMANDE EN COURS AUX MOTEURS
+// Appelée en continu dans le loop().
+//
+// Chaque commande utilise les constantes adaptées
+// à son sens de déplacement (AV ou AR) pour que
+// la compensation de vitesse soit correcte dans
+// les deux directions.
+// ═══════════════════════════════════════════════
+void appliquerCommande() {
+
+  if (commandeEnCours == "avancer") {
+    // Sens AVANT : gauche légèrement réduit (1.5% trop rapide)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "reculer") {
+    // Sens ARRIÈRE : droite légèrement réduit (6.2% trop rapide)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "vag") {
+    // VIRAGE AVANT GAUCHE : droite fort, gauche réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "vad") {
+    // VIRAGE AVANT DROITE : gauche fort, droite réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "veg") {
+    // VIRAGE ARRIÈRE GAUCHE : droite recule fort, gauche réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "ved") {
+    // VIRAGE ARRIÈRE DROITE : gauche recule fort, droite réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_gauche") {
+    // ROTATION GAUCHE sur place :
+    //   droite avance (PWR_DROIT_AV) / gauche recule (PWR_GAUCHE_AR)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_droite") {
+    // ROTATION DROITE sur place :
+    //   gauche avance (PWR_GAUCHE_AV) / droite recule (PWR_DROIT_AR)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else {
+    // STOP : coupe complètement les deux moteurs
+    ledcWrite(canalDroit,  0);
+    ledcWrite(canalGauche, 0);
+  }
+
+  // LED2 allumée si un moteur tourne, éteinte si arrêt
+  digitalWrite(LEDU2, commandeEnCours != "stop" ? HIGH : LOW);
+}
+
+
+// ═══════════════════════════════════════════════
+// GESTIONNAIRES DU SERVEUR WEB
+// ═══════════════════════════════════════════════
+
+// Envoie la page HTML au navigateur
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
+}
+
+// Reçoit une commande depuis le navigateur (/cmd?action=xxx)
+// Met à jour commandeEnCours → le loop() s'occupe du reste
+void handleCmd() {
+  if (server.hasArg("action")) {
+    commandeEnCours = server.arg("action");
+    logf("Commande : %s\n", commandeEnCours.c_str());
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// ───────────────────────────────────────────────
+// Retourne les valeurs BRUTES du magnétomètre (/mag/raw)
+// Les 3 axes X Y Z en LSB (entiers signés 16 bits).
+// Appelé par le GUI toutes les 200 ms.
+// ───────────────────────────────────────────────
+void handleMagRaw() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+  int16_t mz = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 4);
+  String json = "{\"mx\":" + String(mx) +
+                ",\"my\":" + String(my) +
+                ",\"mz\":" + String(mz) + "}";
+  server.send(200, "application/json", json);
+}
+
+// ───────────────────────────────────────────────
+// Retourne les ticks des deux encodeurs (/ticks)
+// noInterrupts/interrupts : lecture atomique pour
+// éviter une valeur à moitié mise à jour si une
+// interruption survient pendant la lecture.
+// ───────────────────────────────────────────────
+void handleTicks() {
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+  String json = "{\"droite\":" + String(d) +
+                ",\"gauche\":" + String(g) + "}";
+  server.send(200, "application/json", json);
+}
+
+// ───────────────────────────────────────────────
+// Remet les deux compteurs à zéro (/ticks/reset)
+// Appelé par le bouton "Remettre à zéro" du GUI.
+// ───────────────────────────────────────────────
+void handleTicksReset() {
+  noInterrupts();
+  pasDroit  = 0;
+  pasGauche = 0;
+  interrupts();
+  logf("Ticks remis a zero\n");
+  server.send(200, "text/plain", "ok");
+}
+
+
+// ═══════════════════════════════════════════════
+// SETUP — exécuté une seule fois au démarrage
+// ═══════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // LEDs : LED1 allumée dès le démarrage
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  digitalWrite(LEDU1, HIGH);
+  digitalWrite(LEDU2, LOW);
+
+  // Moteurs : pins de direction en sortie + canaux PWM
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
+
+  // Encodeurs : INPUT_PULLUP évite les fausses lectures
+  // si le câble n'est pas connecté (pin flottante)
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  // WiFi — doit démarrer AVANT le Telnet et le WebServer
+  WiFi.softAP(ssid, password);
+
+  // Telnet sur port 23 : Serial Monitor sans fil
+  // → dans platformio.ini : monitor_port = socket://192.168.4.1:23
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+
+  // OTA : permet de téléverser le code en WiFi
+  ArduinoOTA.begin();
+
+  // WebServer : sert le GUI sur http://192.168.4.1
+  server.on("/",            handleRoot);
+  server.on("/cmd",         handleCmd);
+  server.on("/mag/raw",     handleMagRaw);
+  server.on("/ticks",       handleTicks);
+  server.on("/ticks/reset", handleTicksReset);
+  server.begin();
+
+  // I2C + magnétomètre
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  initLIS3MDL();
+
+  logf("Calibration chargee :\n");
+  logf("  xOffset=%.1f  yOffset=%.1f\n", CALIB_X_OFFSET, CALIB_Y_OFFSET);
+  logf("  xScale=%.1f   yScale=%.1f\n",  CALIB_X_SCALE,  CALIB_Y_SCALE);
+  logf("GUI dispo sur : http://192.168.4.1\n");
+  logf("Telnet        : socket://192.168.4.1:23\n\n");
+
+  // LED2 clignote une fois : setup terminé, robot prêt
+  digitalWrite(LEDU2, HIGH);
+  delay(300);
+  digitalWrite(LEDU2, LOW);
+}
+
+
+// ═══════════════════════════════════════════════
+// LOOP — tourne en boucle indéfiniment
+// Gère en permanence :
+//   1. Les requêtes HTTP du GUI
+//   2. Les mises à jour OTA
+//   3. Les connexions Telnet (Serial Monitor WiFi)
+//   4. L'application de la commande aux moteurs
+// ═══════════════════════════════════════════════
+void loop() {
+  server.handleClient();   // traite les requêtes HTTP
+  ArduinoOTA.handle();     // vérifie les mises à jour OTA
+  checkTelnet();           // accepte les nouvelles connexions Telnet
+  appliquerCommande();     // applique la commande moteur en cours
+}
