@@ -5,73 +5,94 @@
 #include <WebServer.h>
 #include <Wire.h>
 
-// ───────────────────────────────────────────────
 // LEDs utilisateur
 // LED1 : carte alimentée et code actif
 // LED2 : commande moteur en cours
-// ───────────────────────────────────────────────
+
 #define LEDU1 25
 #define LEDU2 26
 
-// ───────────────────────────────────────────────
-// Enable moteurs droit et gauche (signal PWM)
-// La largeur d'impulsion détermine la puissance :
-//   large → beaucoup d'énergie → tourne vite
-//   courte → peu d'énergie    → tourne lentement
-// ───────────────────────────────────────────────
+// Enable moteurs droit et gauche
+// Décident de la puissance envoyée au moteur : envoie une fréquence
+// Si impulsion large, moteur reçoit beaucoup d'énergie → tourne vite
+// Si impulsion courte, moteur reçoit peu d'énergie → tourne lentement
+// Lorsqu'on utilise la pin, on déclare 3 choses :
+//   - la Fréquence       : vitesse à laquelle l'interrupteur de l'ESP s'ouvre/se ferme
+//   - la Résolution      : nombre de bits sur lequel on découpe la puissance (8 bits = 256 positions)
+//   - le Rapport cyclique: ce qu'on change pendant que le robot roule (temps pendant lequel le courant reste allumé)
+//     ex : si on met 200, on sera à ~80% de puissanceo
 #define EN_D 23
 #define EN_G  4
 
-// ───────────────────────────────────────────────
 // Pins de direction moteur droit
 // IN1=LOW  / IN2=HIGH → sens avant
 // IN1=HIGH / IN2=LOW  → sens arrière
-// ───────────────────────────────────────────────
 #define IN_1_D 19
 #define IN_2_D 18
 
-// ───────────────────────────────────────────────
+
 // Pins de direction moteur gauche
 // IN1=HIGH / IN2=LOW  → sens avant
 // IN1=LOW  / IN2=HIGH → sens arrière
-// ───────────────────────────────────────────────
 #define IN_1_G 17
 #define IN_2_G 16
 
-// ───────────────────────────────────────────────
-// Encodeurs quadrature — voie A uniquement
-// Chaque front montant sur CH_A = 1 tick
-// 1050 ticks = 1 tour complet de roue (70mm diam.)
-//
-// volatile  : le compilateur ne met jamais ces
-//   variables en cache — elles peuvent changer
-//   à tout moment via une interruption
-// IRAM_ATTR : force les ISR en RAM plutôt qu'en
-//   flash → exécution plus rapide, aucun tick manqué
-// ───────────────────────────────────────────────
-#define ENC_D_CH_A 27
-#define ENC_G_CH_A 32
 
+// --- ENCODEURS QUADRATURE (RETROACTION) ---
+// Les encodeurs permettent de mesurer la rotation réelle de l'axe moteur.
+// Le modèle E1210GM possède un disque magnétique qui tourne devant deux capteurs à effet Hall.
+// - Voie A (CH_A) : Envoie des impulsions quand le moteur tourne. En comptant les fronts, on connaît la distance/vitesse.
+// - Voie B (CH_B) : Est décalée de 90° par rapport à la voie A. 
+//   - Si A change avant B, le moteur tourne dans un sens.
+//   - Si B change avant A, le moteur tourne dans l'autre sens.
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+//Constantes de comptage des ticks des moteurs gauche et droite
 volatile long pasDroit  = 0;
 volatile long pasGauche = 0;
 
+//FONCTIONS D'INTERRUPTION
+//force la fonction en RAM plutôt qu'en flash
 void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
 void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 
-// ───────────────────────────────────────────────
-// I2C — communication avec le magnétomètre
-// SDA (pin 21) : ligne de données bit par bit
-// SCL (pin 22) : horloge qui synchronise l'envoi
-// ───────────────────────────────────────────────
+//I2C
+// - SDA (Serial Data) : La ligne qui transporte les bits de données.
+// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
 #define SDA_PIN 21
 #define SCL_PIN 22
 
-// ───────────────────────────────────────────────
-// Magnétomètre LIS3MDL
-// Adresse I2C : 0x1E
-// OUT_X_L : premier registre de sortie (LSB de X)
-//   Les 6 octets suivants : X_L X_H Y_L Y_H Z_L Z_H
-// ───────────────────────────────────────────────
+
+// Magnétomètre LIS3MDL — communication I2C
+//
+// Le LIS3MDL est une puce qui mesure le champ magnétique.
+// On lui parle via le protocole I2C : on envoie l'adresse
+// du capteur, puis le numéro du registre qu'on veut lire
+// ou écrire, comme des cases mémoire numérotées à l'intérieur
+// de la puce.
+//
+// - 0x1E : adresse I2C du capteur
+//   → c'est son "numéro de maison" sur le bus I2C
+//   → sans ça l'ESP32 ne sait pas à qui envoyer les données
+//
+// - CTRL1 à CTRL4 : registres de configuration
+//   → ce sont des cases mémoire internes au capteur
+//   → on y écrit des valeurs au démarrage pour lui dire :
+//     - à quelle fréquence mesurer (10 fois par seconde ici)
+//     - avec quelle précision (±4 gauss ici)
+//     - de mesurer en continu sans qu'on le redemande
+//
+// - OUT_X_L (0x28) : premier registre de données
+//   → c'est la case où le capteur écrit ses mesures
+//   → à partir de cette adresse, 6 octets se suivent :
+//       0x28-0x29 → valeur X (2 octets)
+//       0x2A-0x2B → valeur Y (2 octets)
+//       0x2C-0x2D → valeur Z (2 octets)
+//   → on les lit d'un coup via read16() trois fois de suite
+
 #define LIS3MDL_ADDR 0x1E
 #define LIS3_CTRL1   0x20
 #define LIS3_CTRL2   0x21
@@ -79,83 +100,75 @@ void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 #define LIS3_CTRL4   0x23
 #define LIS3_OUT_X_L 0x28
 
-// ───────────────────────────────────────────────
+
+
 // PARAMÈTRES PWM
-// freq       : 5000 Hz
-// resolution : 8 bits → 256 niveaux (0 à 255)
-// canal 0    → moteur droit
-// canal 1    → moteur gauche
-// ───────────────────────────────────────────────
+//
+// Le PWM (Pulse Width Modulation) est la technique utilisée
+// pour contrôler la puissance envoyée aux moteurs.
+// Au lieu d'envoyer une tension variable, on envoie un signal
+// qui s'allume et s'éteint très rapidement. C'est le rapport
+// entre le temps allumé et le temps éteint qui détermine
+// la puissance reçue par le moteur.
+//
+// - freq (5000 Hz) : vitesse à laquelle le signal s'allume
+//   et s'éteint. 5000 Hz = 5000 fois par seconde.
+//   Trop basse → le moteur vibre et fait du bruit.
+//   Trop haute → l'ESP32 ne suit plus.
+//   5000 Hz est un bon compromis pour ce type de moteur.
+//
+// - resolution (8 bits) : précision du réglage de puissance.
+//   8 bits = 2^8 = 256 niveaux possibles, de 0 à 255.
+//   0   = moteur complètement éteint
+//   255 = moteur à pleine puissance
+//   200 = environ 78% de puissance
+//
+// - canalDroit / canalGauche : l'ESP32 gère plusieurs signaux
+//   PWM indépendants appelés "canaux". On assigne un canal
+//   à chaque moteur pour les contrôler séparément.
+//   Canal 0 → moteur droit / Canal 1 → moteur gauche
+
 const int freq        = 5000;
 const int resolution  = 8;
 const int canalDroit  = 0;
 const int canalGauche = 1;
 
-// ───────────────────────────────────────────────
 // COMPENSATION DE VITESSE MOTEURS
-//
-// Les moteurs n'ont pas exactement la même vitesse
-// à puissance identique, et ce déséquilibre est
-// différent en avant et en arrière (frottements
-// et couple moteur asymétriques selon le sens).
-//
-// Mesuré en marche AVANT (même distance) :
-//   Gauche : 36632 ticks / Droite : 36089 ticks
-//   → Gauche 1.5% trop rapide
-//   → PWR_GAUCHE_AV = 200 × (36089/36632) ≈ 197
-//
-// Mesuré en marche ARRIÈRE (même distance) :
-//   Droite : 2071 ticks / Gauche : 1943 ticks
-//   → Droite 6.2% trop rapide
-//   → PWR_DROIT_AR = 200 × (1943/2071) ≈ 188
-//
-// PWR_FAIBLE : puissance réduite pour la roue
-//   intérieure lors des virages
-// ───────────────────────────────────────────────
 const int PWR_DROIT_AV  = 200;   // avant   — référence
-const int PWR_GAUCHE_AV = 197;   // avant   — gauche 1.5% trop rapide
+const int PWR_GAUCHE_AV = 197;   // avant   
 const int PWR_DROIT_AR  = 183;   // arrière — référence
-const int PWR_GAUCHE_AR = 200;   // arrière — gauche 3.6% trop rapide
+const int PWR_GAUCHE_AR = 200;   
 const int PWR_FAIBLE    = 100;   // roue intérieure des virages
 
-// ───────────────────────────────────────────────
+
 // WIFI
 // L'ESP32 crée son propre réseau WiFi
-// → connecte ton téléphone/PC à "Draw_GOAAAT"
-// → ouvre 192.168.4.1 dans le navigateur
-// → pour le Serial Monitor PlatformIO :
-//   monitor_port = socket://192.168.4.1:23
-// ───────────────────────────────────────────────
+
 const char* ssid     = "Draw_GOAAAT";
 const char* password = "12345678";
 
-// ───────────────────────────────────────────────
-// SERVEUR TELNET (port 23)
+//TELNET
 // Remplace le câble USB pour le Serial Monitor.
 // Permet de voir les logs sans fil, notamment
 // pendant la calibration magnétomètre.
 //
 // WiFiServer  : écoute les connexions entrantes
 // WiFiClient  : représente le PC connecté
-// ───────────────────────────────────────────────
 WiFiServer telnetServer(23);
 WiFiClient telnetClient;
 
 // Serveur HTTP (port 80) : sert la page HTML du GUI
 WebServer server(80);
 
-// ───────────────────────────────────────────────
+
 // Commande active : détermine ce que font les
 // moteurs dans le loop(). Vaut "stop" par défaut.
-// ───────────────────────────────────────────────
+
 String commandeEnCours = "stop";
 
-// ───────────────────────────────────────────────
+
 // CALIBRATION MAGNÉTOMÈTRE — valeurs mesurées
-//
-// Ces valeurs ont été obtenues en faisant tourner
-// le robot sur lui-même à 360° sans câble USB.
-// Le magnétomètre décrit une ellipse dans le plan
+
 // X/Y. On mesure ses extrêmes pour calculer :
 //
 //   xOffset/yOffset : centre de l'ellipse
@@ -171,8 +184,6 @@ String commandeEnCours = "stop";
 //   ny  = (my - yOffset) / yScale   → entre -1 et +1
 //   cap = atan2(-ny, nx) × 180/π    → 0° à 360°
 //
-// Résultat de calibration obtenu :
-//   Ratio X/Y = 1.01 → quasi cercle parfait ✓
 // ───────────────────────────────────────────────
 const float CALIB_X_OFFSET = -1833.5;
 const float CALIB_Y_OFFSET =   753.5;
@@ -180,16 +191,11 @@ const float CALIB_X_SCALE  =  1691.5;
 const float CALIB_Y_SCALE  =  1710.5;
 
 
-// ═══════════════════════════════════════════════
-// FONCTION DE LOG — remplace Serial.printf()
+// FONCTION DE LOG 
 //
 // Envoie le message à la fois :
 //   - sur le port série USB (si câble branché)
 //   - au client Telnet connecté en WiFi
-//
-// Usage identique à Serial.printf :
-//   logf("Cap : %d degres\n", cap);
-// ═══════════════════════════════════════════════
 void logf(const char* format, ...) {
   char buf[128];
   va_list args;
@@ -201,13 +207,12 @@ void logf(const char* format, ...) {
     telnetClient.print(buf);
 }
 
-// ═══════════════════════════════════════════════
-// GESTION TELNET — à appeler dans le loop()
+
+// GESTION TELNET —
 //
 // Vérifie si un nouveau client veut se connecter.
 // Si un ancien client est déjà là, on le déconnecte
 // pour accepter la nouvelle connexion.
-// ═══════════════════════════════════════════════
 void checkTelnet() {
   if (telnetServer.hasClient()) {
     if (telnetClient && telnetClient.connected())
@@ -216,13 +221,11 @@ void checkTelnet() {
   }
 }
 
-
-// ═══════════════════════════════════════════════
 // UTILITAIRES I2C
 // writeReg : écrit un octet dans un registre
 // read16   : lit 2 octets consécutifs little-endian
 //   (LSB en premier, MSB en second)
-// ═══════════════════════════════════════════════
+
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -240,7 +243,7 @@ int16_t read16(uint8_t addr, uint8_t reg) {
   return (int16_t)(hi << 8 | lo);
 }
 
-// ═══════════════════════════════════════════════
+
 // INIT MAGNÉTOMÈTRE LIS3MDL
 // CTRL1 0x70 : ultra-haute performance XY, ODR 10Hz
 // CTRL2 0x00 : pleine échelle ±4 gauss
@@ -256,14 +259,12 @@ void initLIS3MDL() {
 }
 
 
-// ═══════════════════════════════════════════════
+
 // PAGE HTML DU GUI
-// Stockée en flash (PROGMEM) pour économiser la RAM.
 // Contient :
 //   - boutons de direction
 //   - bloc magnétomètre brut X Y Z
 //   - bloc ticks encodeurs + bouton reset
-// ═══════════════════════════════════════════════
 const char PAGE_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html lang="fr">
@@ -439,15 +440,12 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
 )rawhtml";
 
 
-// ═══════════════════════════════════════════════
 // APPLIQUE LA COMMANDE EN COURS AUX MOTEURS
-// Appelée en continu dans le loop().
 //
 // Chaque commande utilise les constantes adaptées
 // à son sens de déplacement (AV ou AR) pour que
 // la compensation de vitesse soit correcte dans
 // les deux directions.
-// ═══════════════════════════════════════════════
 void appliquerCommande() {
 
   if (commandeEnCours == "avancer") {
@@ -519,17 +517,16 @@ void appliquerCommande() {
 }
 
 
-// ═══════════════════════════════════════════════
+
 // GESTIONNAIRES DU SERVEUR WEB
-// ═══════════════════════════════════════════════
 
 // Envoie la page HTML au navigateur
 void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
 }
 
-// Reçoit une commande depuis le navigateur (/cmd?action=xxx)
-// Met à jour commandeEnCours → le loop() s'occupe du reste
+// Reçoit une commande depuis le navigateur 
+// Met à jour commandeEnCours 
 void handleCmd() {
   if (server.hasArg("action")) {
     commandeEnCours = server.arg("action");
@@ -538,11 +535,10 @@ void handleCmd() {
   server.send(200, "text/plain", "ok");
 }
 
-// ───────────────────────────────────────────────
 // Retourne les valeurs BRUTES du magnétomètre (/mag/raw)
 // Les 3 axes X Y Z en LSB (entiers signés 16 bits).
 // Appelé par le GUI toutes les 200 ms.
-// ───────────────────────────────────────────────
+
 void handleMagRaw() {
   int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
   int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
@@ -553,12 +549,10 @@ void handleMagRaw() {
   server.send(200, "application/json", json);
 }
 
-// ───────────────────────────────────────────────
 // Retourne les ticks des deux encodeurs (/ticks)
 // noInterrupts/interrupts : lecture atomique pour
 // éviter une valeur à moitié mise à jour si une
 // interruption survient pendant la lecture.
-// ───────────────────────────────────────────────
 void handleTicks() {
   noInterrupts();
   long d = pasDroit;
@@ -569,10 +563,9 @@ void handleTicks() {
   server.send(200, "application/json", json);
 }
 
-// ───────────────────────────────────────────────
+
 // Remet les deux compteurs à zéro (/ticks/reset)
 // Appelé par le bouton "Remettre à zéro" du GUI.
-// ───────────────────────────────────────────────
 void handleTicksReset() {
   noInterrupts();
   pasDroit  = 0;
@@ -582,10 +575,6 @@ void handleTicksReset() {
   server.send(200, "text/plain", "ok");
 }
 
-
-// ═══════════════════════════════════════════════
-// SETUP — exécuté une seule fois au démarrage
-// ═══════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -602,7 +591,7 @@ void setup() {
   ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
 
   // Encodeurs : INPUT_PULLUP évite les fausses lectures
-  // si le câble n'est pas connecté (pin flottante)
+
   pinMode(ENC_D_CH_A, INPUT_PULLUP);
   pinMode(ENC_G_CH_A, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
@@ -619,7 +608,6 @@ void setup() {
   // OTA : permet de téléverser le code en WiFi
   ArduinoOTA.begin();
 
-  // WebServer : sert le GUI sur http://192.168.4.1
   server.on("/",            handleRoot);
   server.on("/cmd",         handleCmd);
   server.on("/mag/raw",     handleMagRaw);
@@ -644,15 +632,6 @@ void setup() {
   digitalWrite(LEDU2, LOW);
 }
 
-
-// ═══════════════════════════════════════════════
-// LOOP — tourne en boucle indéfiniment
-// Gère en permanence :
-//   1. Les requêtes HTTP du GUI
-//   2. Les mises à jour OTA
-//   3. Les connexions Telnet (Serial Monitor WiFi)
-//   4. L'application de la commande aux moteurs
-// ═══════════════════════════════════════════════
 void loop() {
   server.handleClient();   // traite les requêtes HTTP
   ArduinoOTA.handle();     // vérifie les mises à jour OTA
