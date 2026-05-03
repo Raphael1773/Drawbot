@@ -135,8 +135,8 @@ const int canalGauche = 1;
 
 // COMPENSATION DE VITESSE MOTEURS
 const int PWR_DROIT_AV  = 200;   // avant   — référence
-const int PWR_GAUCHE_AV = 197;   // avant   
-const int PWR_DROIT_AR  = 183;   // arrière — référence
+const int PWR_GAUCHE_AV = 206;   // avant   
+const int PWR_DROIT_AR  = 192;   // arrière — référence
 const int PWR_GAUCHE_AR = 200;   
 const int PWR_FAIBLE    = 100;   // roue intérieure des virages
 
