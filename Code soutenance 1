@@ -20,7 +20,7 @@
 //   - la Fréquence       : vitesse à laquelle l'interrupteur de l'ESP s'ouvre/se ferme
 //   - la Résolution      : nombre de bits sur lequel on découpe la puissance (8 bits = 256 positions)
 //   - le Rapport cyclique: ce qu'on change pendant que le robot roule (temps pendant lequel le courant reste allumé)
-//     ex : si on met 200, on sera à ~80% de puissanceo
+//     ex : si on met 200, on sera à ~80% de puissance
 #define EN_D 23
 #define EN_G  4
 
@@ -30,13 +30,11 @@
 #define IN_1_D 19
 #define IN_2_D 18
 
-
 // Pins de direction moteur gauche
 // IN1=HIGH / IN2=LOW  → sens avant
 // IN1=LOW  / IN2=HIGH → sens arrière
 #define IN_1_G 17
 #define IN_2_G 16
-
 
 // --- ENCODEURS QUADRATURE (RETROACTION) ---
 // Les encodeurs permettent de mesurer la rotation réelle de l'axe moteur.
@@ -64,7 +62,6 @@ void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 // - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
 #define SDA_PIN 21
 #define SCL_PIN 22
-
 
 // Magnétomètre LIS3MDL — communication I2C
 //
@@ -100,8 +97,6 @@ void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 #define LIS3_CTRL4   0x23
 #define LIS3_OUT_X_L 0x28
 
-
-
 // PARAMÈTRES PWM
 //
 // Le PWM (Pulse Width Modulation) est la technique utilisée
@@ -135,11 +130,10 @@ const int canalGauche = 1;
 
 // COMPENSATION DE VITESSE MOTEURS
 const int PWR_DROIT_AV  = 200;   // avant   — référence
-const int PWR_GAUCHE_AV = 206;   // avant   
+const int PWR_GAUCHE_AV = 206;   // avant
 const int PWR_DROIT_AR  = 192;   // arrière — référence
-const int PWR_GAUCHE_AR = 200;   
+const int PWR_GAUCHE_AR = 200;
 const int PWR_FAIBLE    = 100;   // roue intérieure des virages
-
 
 // WIFI
 // L'ESP32 crée son propre réseau WiFi
@@ -160,36 +154,34 @@ WiFiClient telnetClient;
 // Serveur HTTP (port 80) : sert la page HTML du GUI
 WebServer server(80);
 
-
 // Commande active : détermine ce que font les
 // moteurs dans le loop(). Vaut "stop" par défaut.
-
 String commandeEnCours = "stop";
 
-
 // CALIBRATION MAGNÉTOMÈTRE — valeurs mesurées
-
-// X/Y. On mesure ses extrêmes pour calculer :
+//
+// En faisant tourner le robot à 360°, le magnéto
+// décrit une ellipse dans le plan X/Y.
+// On mesure ses extrêmes pour corriger deux biais :
 //
 //   xOffset/yOffset : centre de l'ellipse
 //     → compense le hard iron (champ parasite fixe
-//       créé par les moteurs, vis, etc.)
+//       créé par les moteurs, vis, batteries...)
 //
 //   xScale/yScale : rayon de l'ellipse sur chaque axe
 //     → compense le soft iron (déformation du champ
 //       par les matériaux proches du capteur)
 //
-// Formule de correction (appliquée dans handleMagRaw) :
+// Formule appliquée dans handleCap() :
 //   nx  = (mx - xOffset) / xScale   → entre -1 et +1
 //   ny  = (my - yOffset) / yScale   → entre -1 et +1
 //   cap = atan2(-ny, nx) × 180/π    → 0° à 360°
 //
-// ───────────────────────────────────────────────
-const float CALIB_X_OFFSET = -1833.5;
-const float CALIB_Y_OFFSET =   753.5;
-const float CALIB_X_SCALE  =  1691.5;
-const float CALIB_Y_SCALE  =  1710.5;
-
+// Résultat obtenu : Ratio X/Y = 1.03 ✓
+const float CALIB_X_OFFSET = -2045.0;
+const float CALIB_Y_OFFSET =   654.0;
+const float CALIB_X_SCALE  =  1857.0;
+const float CALIB_Y_SCALE  =  1922.0;
 
 // FONCTION DE LOG 
 //
@@ -207,8 +199,7 @@ void logf(const char* format, ...) {
     telnetClient.print(buf);
 }
 
-
-// GESTION TELNET —
+// GESTION TELNET
 //
 // Vérifie si un nouveau client veut se connecter.
 // Si un ancien client est déjà là, on le déconnecte
@@ -225,7 +216,6 @@ void checkTelnet() {
 // writeReg : écrit un octet dans un registre
 // read16   : lit 2 octets consécutifs little-endian
 //   (LSB en premier, MSB en second)
-
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -243,13 +233,11 @@ int16_t read16(uint8_t addr, uint8_t reg) {
   return (int16_t)(hi << 8 | lo);
 }
 
-
 // INIT MAGNÉTOMÈTRE LIS3MDL
 // CTRL1 0x70 : ultra-haute performance XY, ODR 10Hz
 // CTRL2 0x00 : pleine échelle ±4 gauss
 // CTRL3 0x00 : mode de mesure continu
 // CTRL4 0x0C : ultra-haute performance Z
-// ═══════════════════════════════════════════════
 void initLIS3MDL() {
   writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
   writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
@@ -259,12 +247,11 @@ void initLIS3MDL() {
 }
 
 
-
 // PAGE HTML DU GUI
 // Contient :
 //   - boutons de direction
-//   - bloc magnétomètre brut X Y Z
-//   - bloc ticks encodeurs + bouton reset
+//   - boussole calibrée (0° à 360°)
+//   - ticks encodeurs + bouton reset
 const char PAGE_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html lang="fr">
@@ -318,11 +305,30 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
     .data-label { font-size: 0.78rem; color: #888; align-self: center; }
     .data-val { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
-    .data-val.x { color: #f66; }
-    .data-val.y { color: #6f6; }
-    .data-val.z { color: #66f; }
     .data-val.droite { color: #0af; }
     .data-val.gauche { color: #fa0; }
+    /* ── Boussole ── */
+    #compass-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    #compass-ring {
+      width: 110px; height: 110px; border: 2px solid #333; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; position: relative;
+    }
+    #compass-ring::before { content:'N'; position:absolute; top:5px;
+      font-size:0.75rem; color:#f44; font-weight:bold; }
+    #compass-ring::after  { content:'S'; position:absolute; bottom:5px;
+      font-size:0.75rem; color:#888; }
+    #compass-e { position:absolute; right:6px; top:50%; transform:translateY(-50%);
+      font-size:0.65rem; color:#888; }
+    #compass-w { position:absolute; left:6px; top:50%; transform:translateY(-50%);
+      font-size:0.65rem; color:#888; }
+    #needle {
+      width: 4px; height: 86px; position: absolute;
+      transform-origin: center center; transition: transform 0.3s ease;
+      display: flex; flex-direction: column;
+    }
+    .needle-n { width:4px; height:43px; background:#f44; border-radius:2px 2px 0 0; }
+    .needle-s { width:4px; height:43px; background:#555; border-radius:0 0 2px 2px; }
+    #cap-display { font-size: 2rem; font-weight: bold; color: #fff; letter-spacing: 2px; }
     #btn-reset-ticks {
       background: #222; border: 1px solid #555; border-radius: 8px;
       color: #aaa; font-size: 0.75rem; padding: 5px 12px;
@@ -347,19 +353,23 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="btn" id="btn-ved"  data-cmd="ved">↘</div>
   </div>
 
-  <!-- ── BLOC MAGNÉTOMÈTRE BRUT ──────────────────────────
-       Valeurs brutes en LSB sur les 3 axes.
-       Mis à jour toutes les 200 ms via /mag/raw
+  <!-- ── BOUSSOLE CALIBRÉE ───────────────────────────────
+       Affiche le cap entre 0° et 360° calculé à partir
+       des valeurs calibrées du magnétomètre.
+       L'aiguille tourne en temps réel via /cap (200ms).
   ──────────────────────────────────────────────────────── -->
   <div class="data-box">
-    <h2 class="vert">📡 MAGNÉTOMÈTRE BRUT</h2>
-    <div class="data-grid">
-      <span class="data-label">Axe X (LSB)</span>
-      <span class="data-val x" id="mag-x">—</span>
-      <span class="data-label">Axe Y (LSB)</span>
-      <span class="data-val y" id="mag-y">—</span>
-      <span class="data-label">Axe Z (LSB)</span>
-      <span class="data-val z" id="mag-z">—</span>
+    <h2 class="vert">🧭 ORIENTATION</h2>
+    <div id="compass-wrap">
+      <div id="compass-ring">
+        <span id="compass-e">E</span>
+        <span id="compass-w">O</span>
+        <div id="needle">
+          <div class="needle-n"></div>
+          <div class="needle-s"></div>
+        </div>
+      </div>
+      <div id="cap-display">—°</div>
     </div>
   </div>
 
@@ -407,18 +417,21 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
       btn.addEventListener('touchcancel', () => { btn.classList.remove('pressed'); send('stop'); });
     });
 
-    async function fetchMagBrut() {
+    // Boussole : appelle /cap toutes les 200ms et fait tourner l'aiguille
+    const needle     = document.getElementById('needle');
+    const capDisplay = document.getElementById('cap-display');
+    async function fetchCap() {
       try {
-        const r = await fetch('/mag/raw');
+        const r = await fetch('/cap');
         const d = await r.json();
-        document.getElementById('mag-x').textContent = d.mx;
-        document.getElementById('mag-y').textContent = d.my;
-        document.getElementById('mag-z').textContent = d.mz;
+        capDisplay.textContent = d.cap + '°';
+        needle.style.transform = 'rotate(' + d.cap + 'deg)';
       } catch(e) {}
     }
-    setInterval(fetchMagBrut, 200);
-    fetchMagBrut();
+    setInterval(fetchCap, 200);
+    fetchCap();
 
+    // Ticks encodeurs : appelle /ticks toutes les 200ms
     async function fetchTicks() {
       try {
         const r = await fetch('/ticks');
@@ -517,7 +530,6 @@ void appliquerCommande() {
 }
 
 
-
 // GESTIONNAIRES DU SERVEUR WEB
 
 // Envoie la page HTML au navigateur
@@ -525,8 +537,8 @@ void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
 }
 
-// Reçoit une commande depuis le navigateur 
-// Met à jour commandeEnCours 
+// Reçoit une commande depuis le navigateur
+// Met à jour commandeEnCours
 void handleCmd() {
   if (server.hasArg("action")) {
     commandeEnCours = server.arg("action");
@@ -535,18 +547,25 @@ void handleCmd() {
   server.send(200, "text/plain", "ok");
 }
 
-// Retourne les valeurs BRUTES du magnétomètre (/mag/raw)
-// Les 3 axes X Y Z en LSB (entiers signés 16 bits).
-// Appelé par le GUI toutes les 200 ms.
-
-void handleMagRaw() {
+// Retourne le cap calibré en JSON (/cap)
+// Applique les offsets et scales mesurés lors de la calibration
+// pour obtenir un angle fiable entre 0° et 360°.
+// -ny corrige l'inversion physique de l'axe Y du LIS3MDL
+// par rapport à la convention boussole standard.
+void handleCap() {
   int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
   int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
-  int16_t mz = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 4);
-  String json = "{\"mx\":" + String(mx) +
-                ",\"my\":" + String(my) +
-                ",\"mz\":" + String(mz) + "}";
-  server.send(200, "application/json", json);
+
+  // Application de la calibration hard iron + soft iron
+  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE;
+  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
+
+  // atan2 donne un angle entre -π et +π → on ramène à 0°-360°
+  float capRad = atan2(-ny, nx);
+  int cap = (int)(capRad * 180.0 / PI);
+  if (cap < 0) cap += 360;
+
+  server.send(200, "application/json", "{\"cap\":" + String(cap) + "}");
 }
 
 // Retourne les ticks des deux encodeurs (/ticks)
@@ -562,7 +581,6 @@ void handleTicks() {
                 ",\"gauche\":" + String(g) + "}";
   server.send(200, "application/json", json);
 }
-
 
 // Remet les deux compteurs à zéro (/ticks/reset)
 // Appelé par le bouton "Remettre à zéro" du GUI.
@@ -591,7 +609,6 @@ void setup() {
   ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
 
   // Encodeurs : INPUT_PULLUP évite les fausses lectures
-
   pinMode(ENC_D_CH_A, INPUT_PULLUP);
   pinMode(ENC_G_CH_A, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
@@ -610,7 +627,7 @@ void setup() {
 
   server.on("/",            handleRoot);
   server.on("/cmd",         handleCmd);
-  server.on("/mag/raw",     handleMagRaw);
+  server.on("/cap",         handleCap);        // cap calibré 0°-360°
   server.on("/ticks",       handleTicks);
   server.on("/ticks/reset", handleTicksReset);
   server.begin();
