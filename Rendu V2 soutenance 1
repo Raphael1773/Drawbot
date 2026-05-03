@@ -1,0 +1,834 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+// LEDs utilisateur
+// LED1 : carte alimentée et code actif
+// LED2 : commande moteur en cours
+
+#define LEDU1 25
+#define LEDU2 26
+
+// Enable moteurs droit et gauche
+// Décident de la puissance envoyée au moteur : envoie une fréquence
+// Si impulsion large, moteur reçoit beaucoup d'énergie → tourne vite
+// Si impulsion courte, moteur reçoit peu d'énergie → tourne lentement
+// Lorsqu'on utilise la pin, on déclare 3 choses :
+//   - la Fréquence       : vitesse à laquelle l'interrupteur de l'ESP s'ouvre/se ferme
+//   - la Résolution      : nombre de bits sur lequel on découpe la puissance (8 bits = 256 positions)
+//   - le Rapport cyclique: ce qu'on change pendant que le robot roule (temps pendant lequel le courant reste allumé)
+//     ex : si on met 200, on sera à ~80% de puissance
+#define EN_D 23
+#define EN_G  4
+
+// Pins de direction moteur droit
+// IN1=LOW  / IN2=HIGH → sens avant
+// IN1=HIGH / IN2=LOW  → sens arrière
+#define IN_1_D 19
+#define IN_2_D 18
+
+// Pins de direction moteur gauche
+// IN1=HIGH / IN2=LOW  → sens avant
+// IN1=LOW  / IN2=HIGH → sens arrière
+#define IN_1_G 17
+#define IN_2_G 16
+
+// --- ENCODEURS QUADRATURE (RETROACTION) ---
+// Les encodeurs permettent de mesurer la rotation réelle de l'axe moteur.
+// Le modèle E1210GM possède un disque magnétique qui tourne devant deux capteurs à effet Hall.
+// - Voie A (CH_A) : Envoie des impulsions quand le moteur tourne. En comptant les fronts, on connaît la distance/vitesse.
+// - Voie B (CH_B) : Est décalée de 90° par rapport à la voie A. 
+//   - Si A change avant B, le moteur tourne dans un sens.
+//   - Si B change avant A, le moteur tourne dans l'autre sens.
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+//Constantes de comptage des ticks des moteurs gauche et droite
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+
+//FONCTIONS D'INTERRUPTION
+//force la fonction en RAM plutôt qu'en flash
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+
+//I2C
+// - SDA (Serial Data) : La ligne qui transporte les bits de données.
+// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Magnétomètre LIS3MDL — communication I2C
+//
+// Le LIS3MDL est une puce qui mesure le champ magnétique.
+// On lui parle via le protocole I2C : on envoie l'adresse
+// du capteur, puis le numéro du registre qu'on veut lire
+// ou écrire, comme des cases mémoire numérotées à l'intérieur
+// de la puce.
+//
+// - 0x1E : adresse I2C du capteur
+//   → c'est son "numéro de maison" sur le bus I2C
+//   → sans ça l'ESP32 ne sait pas à qui envoyer les données
+//
+// - CTRL1 à CTRL4 : registres de configuration
+//   → ce sont des cases mémoire internes au capteur
+//   → on y écrit des valeurs au démarrage pour lui dire :
+//     - à quelle fréquence mesurer (10 fois par seconde ici)
+//     - avec quelle précision (±4 gauss ici)
+//     - de mesurer en continu sans qu'on le redemande
+//
+// - OUT_X_L (0x28) : premier registre de données
+//   → c'est la case où le capteur écrit ses mesures
+//   → à partir de cette adresse, 6 octets se suivent :
+//       0x28-0x29 → valeur X (2 octets)
+//       0x2A-0x2B → valeur Y (2 octets)
+//       0x2C-0x2D → valeur Z (2 octets)
+//   → on les lit d'un coup via read16() trois fois de suite
+
+#define LIS3MDL_ADDR 0x1E
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+// PARAMÈTRES PWM
+//
+// Le PWM (Pulse Width Modulation) est la technique utilisée
+// pour contrôler la puissance envoyée aux moteurs.
+// Au lieu d'envoyer une tension variable, on envoie un signal
+// qui s'allume et s'éteint très rapidement. C'est le rapport
+// entre le temps allumé et le temps éteint qui détermine
+// la puissance reçue par le moteur.
+//
+// - freq (5000 Hz) : vitesse à laquelle le signal s'allume
+//   et s'éteint. 5000 Hz = 5000 fois par seconde.
+//   Trop basse → le moteur vibre et fait du bruit.
+//   Trop haute → l'ESP32 ne suit plus.
+//   5000 Hz est un bon compromis pour ce type de moteur.
+//
+// - resolution (8 bits) : précision du réglage de puissance.
+//   8 bits = 2^8 = 256 niveaux possibles, de 0 à 255.
+//   0   = moteur complètement éteint
+//   255 = moteur à pleine puissance
+//   200 = environ 78% de puissance
+//
+// - canalDroit / canalGauche : l'ESP32 gère plusieurs signaux
+//   PWM indépendants appelés "canaux". On assigne un canal
+//   à chaque moteur pour les contrôler séparément.
+//   Canal 0 → moteur droit / Canal 1 → moteur gauche
+
+const int freq        = 5000;
+const int resolution  = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// COMPENSATION DE VITESSE MOTEURS
+const int PWR_DROIT_AV  = 200;   // avant   — référence
+const int PWR_GAUCHE_AV = 208;   // avant
+const int PWR_DROIT_AR  = 194;   // arrière — référence
+const int PWR_GAUCHE_AR = 200;
+const int PWR_FAIBLE    = 100;   // roue intérieure des virages
+
+// GÉOMÉTRIE DE LA ROUE — pour le calcul de vitesse
+//
+// Ces constantes permettent de convertir les ticks encodeur
+// en grandeurs physiques réelles :
+//
+// TICKS_PAR_TOUR : nombre de fronts montants sur CH_A pour
+//   un tour complet de roue. Mesuré à 1050.
+//
+// DIAM_ROUE_CM : diamètre de la roue en centimètres.
+//   Permet de calculer la circonférence.
+//
+// CIRCONF_CM : distance parcourue en cm pour un tour complet
+//   = π × diamètre = π × 9 ≈ 28.27 cm
+//
+// CM_PAR_TICK : distance réelle parcourue par tick
+//   = circonférence / ticks par tour ≈ 0.0269 cm/tick
+const float TICKS_PAR_TOUR = 1050.0;
+const float DIAM_ROUE_CM   = 9.0;
+const float CIRCONF_CM     = PI * DIAM_ROUE_CM;      // ≈ 28.27 cm
+const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR; // ≈ 0.0269 cm/tick
+
+// CALCUL DE VITESSE — variables internes
+//
+// On mesure la vitesse toutes les INTERVALLE_VITESSE_MS ms
+// en comptant les ticks accumulés depuis la dernière mesure.
+//
+// vitesseD / vitesseG : vitesses calculées en cm/s et RPM,
+//   mises à jour périodiquement et lues par handleVitesse()
+const int INTERVALLE_VITESSE_MS = 200;
+
+float vitesseDcms  = 0.0;   // vitesse roue droite  en cm/s
+float vitesseGcms  = 0.0;   // vitesse roue gauche  en cm/s
+float vitesseDrpm  = 0.0;   // vitesse roue droite  en RPM
+float vitesseGrpm  = 0.0;   // vitesse roue gauche  en RPM
+
+long     pasDroitPrev   = 0;
+long     pasGauchePrev  = 0;
+uint32_t tDerniereVit   = 0;
+
+// WIFI
+// L'ESP32 crée son propre réseau WiFi
+
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+//TELNET
+// Remplace le câble USB pour le Serial Monitor.
+// Permet de voir les logs sans fil, notamment
+// pendant la calibration magnétomètre.
+//
+// WiFiServer  : écoute les connexions entrantes
+// WiFiClient  : représente le PC connecté
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+
+// Serveur HTTP (port 80) : sert la page HTML du GUI
+WebServer server(80);
+
+// Commande active : détermine ce que font les
+// moteurs dans le loop(). Vaut "stop" par défaut.
+String commandeEnCours = "stop";
+
+// CALIBRATION MAGNÉTOMÈTRE — valeurs mesurées
+//
+// En faisant tourner le robot à 360°, le magnéto
+// décrit une ellipse dans le plan X/Y.
+// On mesure ses extrêmes pour corriger deux biais :
+//
+//   xOffset/yOffset : centre de l'ellipse
+//     → compense le hard iron (champ parasite fixe
+//       créé par les moteurs, vis, batteries...)
+//
+//   xScale/yScale : rayon de l'ellipse sur chaque axe
+//     → compense le soft iron (déformation du champ
+//       par les matériaux proches du capteur)
+//
+// Formule appliquée dans handleCap() :
+//   nx  = (mx - xOffset) / xScale   → entre -1 et +1
+//   ny  = (my - yOffset) / yScale   → entre -1 et +1
+//   cap = atan2(-ny, nx) × 180/π    → 0° à 360°
+//
+// Résultat obtenu : Ratio X/Y = 1.03 ✓
+const float CALIB_X_OFFSET = -2045.0;
+const float CALIB_Y_OFFSET =   654.0;
+const float CALIB_X_SCALE  =  1857.0;
+const float CALIB_Y_SCALE  =  1922.0;
+
+
+uint32_t tDerniereCorr = 0;
+
+const float Kp = 0.8;   // moins agressif
+const float Kd = 0.3;   // moins d'amortissement aussi
+const int   INTERVALLE = 10;   // 10ms au lieu de 5ms → plus de ticks accumulés par cycle, mesure plus stable
+
+
+// Variables globales — NE PAS remettre à zéro dans la boucle PD
+long ecartPrecedent  = 0;
+int  pwrDroitCourant  = 200;
+int  pwrGaucheCourant = 200;
+
+void corrigerPD() {
+  if (commandeEnCours != "avancer" && commandeEnCours != "reculer") return;
+  if (millis() - tDerniereCorr < 10) return;   // 10ms
+  tDerniereCorr = millis();
+
+  // Lecture atomique SANS remise à zéro
+  noInterrupts();
+  long ticksD = pasDroit;
+  long ticksG = pasGauche;
+  interrupts();
+
+  // Écart cumulatif comme dans ton code original
+  long  ecart      = ticksD - ticksG;
+  float derivee    = ecart - ecartPrecedent;
+  int   correction = (int)((ecart * Kp) + (derivee * Kd));
+  ecartPrecedent   = ecart;
+
+  int pwrD = constrain(pwrDroitCourant - correction, 0, 255);
+  int pwrG = constrain(pwrGaucheCourant + correction, 0, 255);
+
+  ledcWrite(canalDroit,  pwrD);
+  ledcWrite(canalGauche, pwrG);
+}
+
+// FONCTION DE LOG 
+//
+// Envoie le message à la fois :
+//   - sur le port série USB (si câble branché)
+//   - au client Telnet connecté en WiFi
+void logf(const char* format, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  Serial.print(buf);
+  if (telnetClient && telnetClient.connected())
+    telnetClient.print(buf);
+}
+
+// GESTION TELNET
+//
+// Vérifie si un nouveau client veut se connecter.
+// Si un ancien client est déjà là, on le déconnecte
+// pour accepter la nouvelle connexion.
+void checkTelnet() {
+  if (telnetServer.hasClient()) {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+    telnetClient = telnetServer.available();
+  }
+}
+
+// UTILITAIRES I2C
+// writeReg : écrit un octet dans un registre
+// read16   : lit 2 octets consécutifs little-endian
+//   (LSB en premier, MSB en second)
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg | 0x80);   // bit 7 à 1 → auto-incrément d'adresse
+  Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  return (int16_t)(hi << 8 | lo);
+}
+
+// INIT MAGNÉTOMÈTRE LIS3MDL
+// CTRL1 0x70 : ultra-haute performance XY, ODR 10Hz
+// CTRL2 0x00 : pleine échelle ±4 gauss
+// CTRL3 0x00 : mode de mesure continu
+// CTRL4 0x0C : ultra-haute performance Z
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+  logf("LIS3MDL initialise\n");
+}
+
+// CALCUL DE VITESSE — appelé dans le loop()
+//
+// Toutes les INTERVALLE_VITESSE_MS ms, on lit les ticks
+// accumulés depuis la dernière mesure et on calcule :
+//
+//   ticks/s  = delta_ticks / dt
+//   cm/s     = (ticks/s) × CM_PAR_TICK
+//   RPM      = (ticks/s) / TICKS_PAR_TOUR × 60
+//
+// On repart de la valeur courante (pas de remise à zéro)
+// pour ne pas interférer avec les autres utilisations
+// des compteurs (ticks GUI, PD futur, etc.)
+void calculerVitesse() {
+  if (millis() - tDerniereVit < INTERVALLE_VITESSE_MS) return;
+
+  float dt = (millis() - tDerniereVit) / 1000.0;
+  tDerniereVit = millis();
+
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+
+  float ticksParSecD = (d - pasDroitPrev)  / dt;
+  float ticksParSecG = (g - pasGauchePrev) / dt;
+
+  pasDroitPrev  = d;
+  pasGauchePrev = g;
+
+  // Conversion en cm/s et RPM
+  vitesseDcms = ticksParSecD * CM_PAR_TICK;
+  vitesseGcms = ticksParSecG * CM_PAR_TICK;
+  vitesseDrpm = ticksParSecD / TICKS_PAR_TOUR * 60.0;
+  vitesseGrpm = ticksParSecG / TICKS_PAR_TOUR * 60.0;
+}
+
+
+// PAGE HTML DU GUI
+// Contient :
+//   - boutons de direction
+//   - boussole calibrée (0° à 360°)
+//   - vitesse des roues en cm/s et RPM
+//   - ticks encodeurs + bouton reset
+const char PAGE_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Draw_GOAAAT</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: #111; color: #fff; font-family: sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+      /* PAS de touch-action: none sur le body → scroll mobile autorisé */
+      min-height: 100vh; gap: 16px; padding: 20px;
+    }
+    h1 { font-size: 1.4rem; letter-spacing: 2px; color: #0af; }
+    #status { font-size: 0.85rem; color: #888; height: 20px; transition: color 0.2s; }
+
+    /* touch-action: none uniquement sur les boutons */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 90px);
+      grid-template-rows: repeat(3, 90px);
+      gap: 10px;
+      touch-action: none;
+      user-select: none;
+    }
+    .btn {
+      background: #222; border: 2px solid #444; border-radius: 14px;
+      color: #fff; font-size: 2rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.1s, border-color 0.1s, transform 0.1s;
+      -webkit-user-select: none;
+    }
+    .btn:active, .btn.pressed { background: #0af; border-color: #0af; color: #000; transform: scale(0.93); }
+    .btn.danger:active, .btn.danger.pressed { background: #f44; border-color: #f44; }
+    #btn-vag  { grid-column: 1; grid-row: 1; }
+    #btn-av   { grid-column: 2; grid-row: 1; }
+    #btn-vad  { grid-column: 3; grid-row: 1; }
+    #btn-rg   { grid-column: 1; grid-row: 2; }
+    #btn-stop { grid-column: 2; grid-row: 2; }
+    #btn-rd   { grid-column: 3; grid-row: 2; }
+    #btn-veg  { grid-column: 1; grid-row: 3; }
+    #btn-re   { grid-column: 2; grid-row: 3; }
+    #btn-ved  { grid-column: 3; grid-row: 3; }
+
+    .data-box {
+      background: #1a1a1a; border: 1px solid #333; border-radius: 16px;
+      padding: 14px 24px; display: flex; flex-direction: column;
+      gap: 10px; width: 290px;
+    }
+    .data-box h2 { font-size: 0.9rem; letter-spacing: 1px; }
+    .data-box h2.vert   { color: #0f8; }
+    .data-box h2.bleu   { color: #0af; }
+    .data-box h2.orange { color: #fa0; }
+    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+    .data-label { font-size: 0.78rem; color: #888; align-self: center; }
+    .data-val { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
+    .data-val.droite { color: #0af; }
+    .data-val.gauche { color: #fa0; }
+
+    /* ── Boussole ── */
+    #compass-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    #compass-ring {
+      width: 110px; height: 110px; border: 2px solid #333; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; position: relative;
+    }
+    #compass-ring::before { content:'N'; position:absolute; top:5px;
+      font-size:0.75rem; color:#f44; font-weight:bold; }
+    #compass-ring::after  { content:'S'; position:absolute; bottom:5px;
+      font-size:0.75rem; color:#888; }
+    #compass-e { position:absolute; right:6px; top:50%; transform:translateY(-50%);
+      font-size:0.65rem; color:#888; }
+    #compass-w { position:absolute; left:6px; top:50%; transform:translateY(-50%);
+      font-size:0.65rem; color:#888; }
+    #needle {
+      width: 4px; height: 86px; position: absolute;
+      transform-origin: center center; transition: transform 0.3s ease;
+      display: flex; flex-direction: column;
+    }
+    .needle-n { width:4px; height:43px; background:#f44; border-radius:2px 2px 0 0; }
+    .needle-s { width:4px; height:43px; background:#555; border-radius:0 0 2px 2px; }
+    #cap-display { font-size: 2rem; font-weight: bold; color: #fff; letter-spacing: 2px; }
+
+    #btn-reset-ticks {
+      background: #222; border: 1px solid #555; border-radius: 8px;
+      color: #aaa; font-size: 0.75rem; padding: 5px 12px;
+      cursor: pointer; align-self: center;
+    }
+    #btn-reset-ticks:active { background: #555; color: #fff; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Draw_GOAAAT</h1>
+  <div id="status">En attente...</div>
+
+  <div class="grid">
+    <div class="btn" id="btn-vag"  data-cmd="vag">↖</div>
+    <div class="btn" id="btn-av"   data-cmd="avancer">⬆</div>
+    <div class="btn" id="btn-vad"  data-cmd="vad">↗</div>
+    <div class="btn" id="btn-rg"   data-cmd="rotation_gauche">↺</div>
+    <div class="btn danger" id="btn-stop" data-cmd="stop">■</div>
+    <div class="btn" id="btn-rd"   data-cmd="rotation_droite">↻</div>
+    <div class="btn" id="btn-veg"  data-cmd="veg">↙</div>
+    <div class="btn" id="btn-re"   data-cmd="reculer">⬇</div>
+    <div class="btn" id="btn-ved"  data-cmd="ved">↘</div>
+  </div>
+
+  <!-- ── BOUSSOLE CALIBRÉE ── -->
+  <div class="data-box">
+    <h2 class="vert">🧭 ORIENTATION</h2>
+    <div id="compass-wrap">
+      <div id="compass-ring">
+        <span id="compass-e">E</span>
+        <span id="compass-w">O</span>
+        <div id="needle">
+          <div class="needle-n"></div>
+          <div class="needle-s"></div>
+        </div>
+      </div>
+      <div id="cap-display">—°</div>
+    </div>
+  </div>
+
+  <!-- ── VITESSE DES ROUES ────────────────────────────────
+       Calculée toutes les 200ms côté ESP32 à partir des
+       ticks encodeur et de la géométrie de la roue :
+         roue : 9cm de diamètre / 1050 ticks par tour
+         cm/s = ticks/s × (π×9 / 1050)
+         RPM  = ticks/s / 1050 × 60
+       Mis à jour toutes les 200ms via /vitesse
+  ──────────────────────────────────────────────────────── -->
+  <div class="data-box">
+    <h2 class="orange">⚡ VITESSE ROUES</h2>
+    <div class="data-grid">
+      <span class="data-label">Droite (cm/s)</span>
+      <span class="data-val droite" id="vit-d-cms">—</span>
+      <span class="data-label">Gauche (cm/s)</span>
+      <span class="data-val gauche" id="vit-g-cms">—</span>
+      <span class="data-label">Droite (RPM)</span>
+      <span class="data-val droite" id="vit-d-rpm">—</span>
+      <span class="data-label">Gauche (RPM)</span>
+      <span class="data-val gauche" id="vit-g-rpm">—</span>
+    </div>
+  </div>
+
+  <!-- ── TICKS ENCODEURS ── -->
+  <div class="data-box">
+    <h2 class="bleu">🔢 TICKS ENCODEURS</h2>
+    <div class="data-grid">
+      <span class="data-label">Roue droite</span>
+      <span class="data-val droite" id="tick-d">—</span>
+      <span class="data-label">Roue gauche</span>
+      <span class="data-val gauche" id="tick-g">—</span>
+    </div>
+    <button id="btn-reset-ticks">↺ Remettre à zéro</button>
+  </div>
+
+  <script>
+    const status = document.getElementById('status');
+    const labels = {
+      avancer:         '⬆ Avance',
+      reculer:         '⬇ Recule',
+      vag:             '↖ Virage avant gauche',
+      vad:             '↗ Virage avant droite',
+      veg:             '↙ Virage arrière gauche',
+      ved:             '↘ Virage arrière droite',
+      rotation_gauche: '↺ Rotation gauche',
+      rotation_droite: '↻ Rotation droite',
+      stop:            '■ Arrêt'
+    };
+    function send(cmd) {
+      fetch('/cmd?action=' + cmd).catch(() => {});
+      status.textContent = labels[cmd] || cmd;
+      status.style.color = cmd === 'stop' ? '#888' : '#0af';
+    }
+    document.querySelectorAll('.btn').forEach(btn => {
+      const cmd = btn.dataset.cmd;
+      btn.addEventListener('mousedown',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); });
+      btn.addEventListener('mouseup',    () => { btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+      btn.addEventListener('mouseleave', () => { if (btn.classList.contains('pressed')) { btn.classList.remove('pressed'); send('stop'); } });
+      btn.addEventListener('touchstart',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); }, { passive: false });
+      btn.addEventListener('touchend',    e => { e.preventDefault(); btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+      btn.addEventListener('touchcancel', () => { btn.classList.remove('pressed'); send('stop'); });
+    });
+
+    // Boussole
+    const needle     = document.getElementById('needle');
+    const capDisplay = document.getElementById('cap-display');
+    async function fetchCap() {
+      try {
+        const r = await fetch('/cap');
+        const d = await r.json();
+        capDisplay.textContent = d.cap + '°';
+        needle.style.transform = 'rotate(' + d.cap + 'deg)';
+      } catch(e) {}
+    }
+    setInterval(fetchCap, 200);
+    fetchCap();
+
+    // Vitesse des roues
+    async function fetchVitesse() {
+      try {
+        const r = await fetch('/vitesse');
+        const d = await r.json();
+        document.getElementById('vit-d-cms').textContent = d.dcms.toFixed(1);
+        document.getElementById('vit-g-cms').textContent = d.gcms.toFixed(1);
+        document.getElementById('vit-d-rpm').textContent = d.drpm.toFixed(1);
+        document.getElementById('vit-g-rpm').textContent = d.grpm.toFixed(1);
+      } catch(e) {}
+    }
+    setInterval(fetchVitesse, 200);
+    fetchVitesse();
+
+    // Ticks encodeurs
+    async function fetchTicks() {
+      try {
+        const r = await fetch('/ticks');
+        const d = await r.json();
+        document.getElementById('tick-d').textContent = d.droite;
+        document.getElementById('tick-g').textContent = d.gauche;
+      } catch(e) {}
+    }
+    setInterval(fetchTicks, 200);
+    fetchTicks();
+
+    document.getElementById('btn-reset-ticks').addEventListener('click', async () => {
+      await fetch('/ticks/reset');
+      fetchTicks();
+    });
+  </script>
+</body>
+</html>
+)rawhtml";
+
+
+// APPLIQUE LA COMMANDE EN COURS AUX MOTEURS
+//
+// Chaque commande utilise les constantes adaptées
+// à son sens de déplacement (AV ou AR) pour que
+// la compensation de vitesse soit correcte dans
+// les deux directions.
+void appliquerCommande() {
+
+  if (commandeEnCours == "avancer") {
+    // Sens AVANT : gauche légèrement réduit (1.5% trop rapide)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "reculer") {
+    // Sens ARRIÈRE : droite légèrement réduit (6.2% trop rapide)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "vag") {
+    // VIRAGE AVANT GAUCHE : droite fort, gauche réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "vad") {
+    // VIRAGE AVANT DROITE : gauche fort, droite réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "veg") {
+    // VIRAGE ARRIÈRE GAUCHE : droite recule fort, gauche réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "ved") {
+    // VIRAGE ARRIÈRE DROITE : gauche recule fort, droite réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_gauche") {
+    // ROTATION GAUCHE sur place :
+    //   droite avance (PWR_DROIT_AV) / gauche recule (PWR_GAUCHE_AR)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_droite") {
+    // ROTATION DROITE sur place :
+    //   gauche avance (PWR_GAUCHE_AV) / droite recule (PWR_DROIT_AR)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else {
+    // STOP : coupe complètement les deux moteurs
+    ledcWrite(canalDroit,  0);
+    ledcWrite(canalGauche, 0);
+  }
+
+  // LED2 allumée si un moteur tourne, éteinte si arrêt
+  digitalWrite(LEDU2, commandeEnCours != "stop" ? HIGH : LOW);
+}
+
+
+// GESTIONNAIRES DU SERVEUR WEB
+
+// Envoie la page HTML au navigateur
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
+}
+
+// Reçoit une commande depuis le navigateur
+// Met à jour commandeEnCours
+void handleCmd() {
+  if (server.hasArg("action")) {
+    String nouvelleCommande = server.arg("action");
+
+    // Reset seulement quand on change de mouvement
+    if (nouvelleCommande != commandeEnCours) {
+      noInterrupts();
+      pasDroit  = 0;
+      pasGauche = 0;
+      interrupts();
+      ecartPrecedent = 0;
+    }
+
+    commandeEnCours = nouvelleCommande;
+    logf("Commande : %s\n", commandeEnCours.c_str());
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// Retourne le cap calibré en JSON (/cap)
+// Applique les offsets et scales mesurés lors de la calibration
+// pour obtenir un angle fiable entre 0° et 360°.
+// -ny corrige l'inversion physique de l'axe Y du LIS3MDL
+// par rapport à la convention boussole standard.
+void handleCap() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+
+  // Application de la calibration hard iron + soft iron
+  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE;
+  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
+
+  // atan2 donne un angle entre -π et +π → on ramène à 0°-360°
+  float capRad = atan2(-ny, nx);
+  int cap = (int)(capRad * 180.0 / PI);
+  if (cap < 0) cap += 360;
+
+  server.send(200, "application/json", "{\"cap\":" + String(cap) + "}");
+}
+
+// Retourne les vitesses des deux roues en cm/s et RPM (/vitesse)
+// Les valeurs sont calculées dans calculerVitesse() dans le loop()
+// et simplement lues ici pour les renvoyer au GUI.
+void handleVitesse() {
+  char json[120];
+  snprintf(json, sizeof(json),
+    "{\"dcms\":%.1f,\"gcms\":%.1f,\"drpm\":%.1f,\"grpm\":%.1f}",
+    vitesseDcms, vitesseGcms, vitesseDrpm, vitesseGrpm);
+  server.send(200, "application/json", json);
+}
+
+// Retourne les ticks des deux encodeurs (/ticks)
+// noInterrupts/interrupts : lecture atomique pour
+// éviter une valeur à moitié mise à jour si une
+// interruption survient pendant la lecture.
+void handleTicks() {
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+  String json = "{\"droite\":" + String(d) +
+                ",\"gauche\":" + String(g) + "}";
+  server.send(200, "application/json", json);
+}
+
+// Remet les deux compteurs à zéro (/ticks/reset)
+// Appelé par le bouton "Remettre à zéro" du GUI.
+void handleTicksReset() {
+  noInterrupts();
+  pasDroit  = 0;
+  pasGauche = 0;
+  interrupts();
+  pasDroitPrev  = 0;
+  pasGauchePrev = 0;
+  logf("Ticks remis a zero\n");
+  server.send(200, "text/plain", "ok");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // LEDs : LED1 allumée dès le démarrage
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  digitalWrite(LEDU1, HIGH);
+  digitalWrite(LEDU2, LOW);
+
+  // Moteurs : pins de direction en sortie + canaux PWM
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
+
+  // Encodeurs : INPUT_PULLUP évite les fausses lectures
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  // WiFi — doit démarrer AVANT le Telnet et le WebServer
+  WiFi.softAP(ssid, password);
+
+  // Telnet sur port 23 : Serial Monitor sans fil
+  // → dans platformio.ini : monitor_port = socket://192.168.4.1:23
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+
+  // OTA : permet de téléverser le code en WiFi
+  ArduinoOTA.begin();
+
+  server.on("/",            handleRoot);
+  server.on("/cmd",         handleCmd);
+  server.on("/cap",         handleCap);
+  server.on("/vitesse",     handleVitesse);   // vitesse cm/s et RPM
+  server.on("/ticks",       handleTicks);
+  server.on("/ticks/reset", handleTicksReset);
+  server.begin();
+
+  // I2C + magnétomètre
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  initLIS3MDL();
+
+  tDerniereVit = millis();
+
+  logf("Calibration chargee :\n");
+  logf("  xOffset=%.1f  yOffset=%.1f\n", CALIB_X_OFFSET, CALIB_Y_OFFSET);
+  logf("  xScale=%.1f   yScale=%.1f\n",  CALIB_X_SCALE,  CALIB_Y_SCALE);
+  logf("GUI dispo sur : http://192.168.4.1\n");
+  logf("Telnet        : socket://192.168.4.1:23\n\n");
+
+  // LED2 clignote une fois : setup terminé, robot prêt
+  digitalWrite(LEDU2, HIGH);
+  delay(300);
+  digitalWrite(LEDU2, LOW);
+}
+
+void loop() {
+  server.handleClient();
+  ArduinoOTA.handle();
+  checkTelnet();
+  appliquerCommande();
+  corrigerPD();       // ← s'exécute toutes les 5ms
+  calculerVitesse();
+}
