@@ -65,30 +65,29 @@ void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 
 // Magnétomètre LIS3MDL — communication I2C
 //
-// Le LIS3MDL est une puce qui mesure le champ magnétique.
+// Le LIS3MDL  mesure le champ magnétique.
 // On lui parle via le protocole I2C : on envoie l'adresse
 // du capteur, puis le numéro du registre qu'on veut lire
 // ou écrire, comme des cases mémoire numérotées à l'intérieur
 // de la puce.
 //
 // - 0x1E : adresse I2C du capteur
-//   → c'est son "numéro de maison" sur le bus I2C
-//   → sans ça l'ESP32 ne sait pas à qui envoyer les données
+//  - sans ça l'ESP32 ne sait pas à qui envoyer les données
 //
 // - CTRL1 à CTRL4 : registres de configuration
-//   → ce sont des cases mémoire internes au capteur
-//   → on y écrit des valeurs au démarrage pour lui dire :
+//   - ce sont des cases mémoire internes au capteur
+//   - on y écrit des valeurs au démarrage pour lui dire :
 //     - à quelle fréquence mesurer (10 fois par seconde ici)
-//     - avec quelle précision (±4 gauss ici)
+//     - avec quelle précision (en gauss)
 //     - de mesurer en continu sans qu'on le redemande
 //
 // - OUT_X_L (0x28) : premier registre de données
-//   → c'est la case où le capteur écrit ses mesures
-//   → à partir de cette adresse, 6 octets se suivent :
+//   case où le capteur écrit ses mesures
+//   à partir de cette adresse, 6 octets se suivent :
 //       0x28-0x29 → valeur X (2 octets)
 //       0x2A-0x2B → valeur Y (2 octets)
 //       0x2C-0x2D → valeur Z (2 octets)
-//   → on les lit d'un coup via read16() trois fois de suite
+//   - on les lit d'un coup via read16() trois fois de suite
 
 #define LIS3MDL_ADDR 0x1E
 #define LIS3_CTRL1   0x20
@@ -98,29 +97,16 @@ void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 #define LIS3_OUT_X_L 0x28
 
 // PARAMÈTRES PWM
-//
-// Le PWM (Pulse Width Modulation) est la technique utilisée
-// pour contrôler la puissance envoyée aux moteurs.
 // Au lieu d'envoyer une tension variable, on envoie un signal
 // qui s'allume et s'éteint très rapidement. C'est le rapport
 // entre le temps allumé et le temps éteint qui détermine
 // la puissance reçue par le moteur.
 //
-// - freq (5000 Hz) : vitesse à laquelle le signal s'allume
-//   et s'éteint. 5000 Hz = 5000 fois par seconde.
-//   Trop basse → le moteur vibre et fait du bruit.
-//   Trop haute → l'ESP32 ne suit plus.
-//   5000 Hz est un bon compromis pour ce type de moteur.
+// - freq (5000 Hz) : vitesse à laquelle le signal s'allume et s'éteint.
 //
 // - resolution (8 bits) : précision du réglage de puissance.
-//   8 bits = 2^8 = 256 niveaux possibles, de 0 à 255.
-//   0   = moteur complètement éteint
-//   255 = moteur à pleine puissance
-//   200 = environ 78% de puissance
 //
-// - canalDroit / canalGauche : l'ESP32 gère plusieurs signaux
-//   PWM indépendants appelés "canaux". On assigne un canal
-//   à chaque moteur pour les contrôler séparément.
+//  canalDroit / canalGauche :gérer signaux reçu des moteurs
 //   Canal 0 → moteur droit / Canal 1 → moteur gauche
 
 const int freq        = 5000;
@@ -129,6 +115,7 @@ const int canalDroit  = 0;
 const int canalGauche = 1;
 
 // COMPENSATION DE VITESSE MOTEURS
+//suite a des tests empiriques
 const int PWR_DROIT_AV  = 200;   // avant   — référence
 const int PWR_GAUCHE_AV = 208;   // avant
 const int PWR_DROIT_AR  = 194;   // arrière — référence
@@ -136,16 +123,8 @@ const int PWR_GAUCHE_AR = 200;
 const int PWR_FAIBLE    = 100;   // roue intérieure des virages
 
 // GÉOMÉTRIE DE LA ROUE — pour le calcul de vitesse
-//
-// Ces constantes permettent de convertir les ticks encodeur
-// en grandeurs physiques réelles :
-//
-// TICKS_PAR_TOUR : nombre de fronts montants sur CH_A pour
-//   un tour complet de roue. Mesuré à 1050.
-//
-// DIAM_ROUE_CM : diamètre de la roue en centimètres.
-//   Permet de calculer la circonférence.
-//
+// roue de diamètre 90mm
+//1050 ticks pour faire un tour complet
 // CIRCONF_CM : distance parcourue en cm pour un tour complet
 //   = π × diamètre = π × 9 ≈ 28.27 cm
 //
@@ -157,7 +136,6 @@ const float CIRCONF_CM     = PI * DIAM_ROUE_CM;      // ≈ 28.27 cm
 const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR; // ≈ 0.0269 cm/tick
 
 // CALCUL DE VITESSE — variables internes
-//
 // On mesure la vitesse toutes les INTERVALLE_VITESSE_MS ms
 // en comptant les ticks accumulés depuis la dernière mesure.
 //
@@ -175,13 +153,11 @@ long     pasGauchePrev  = 0;
 uint32_t tDerniereVit   = 0;
 
 // WIFI
-// L'ESP32 crée son propre réseau WiFi
 
 const char* ssid     = "Draw_GOAAAT";
 const char* password = "12345678";
 
 //TELNET
-// Remplace le câble USB pour le Serial Monitor.
 // Permet de voir les logs sans fil, notamment
 // pendant la calibration magnétomètre.
 //
@@ -227,7 +203,7 @@ uint32_t tDerniereCorr = 0;
 
 const float Kp = 0.8;   // moins agressif
 const float Kd = 0.3;   // moins d'amortissement aussi
-const int   INTERVALLE = 10;   // 10ms au lieu de 5ms → plus de ticks accumulés par cycle, mesure plus stable
+const int   INTERVALLE = 10;   // 10ms 
 
 
 // Variables globales — NE PAS remettre à zéro dans la boucle PD
@@ -236,17 +212,18 @@ int  pwrDroitCourant  = 200;
 int  pwrGaucheCourant = 200;
 
 void corrigerPD() {
+
   if (commandeEnCours != "avancer" && commandeEnCours != "reculer") return;
   if (millis() - tDerniereCorr < 10) return;   // 10ms
   tDerniereCorr = millis();
 
-  // Lecture atomique SANS remise à zéro
+
   noInterrupts();
   long ticksD = pasDroit;
   long ticksG = pasGauche;
   interrupts();
 
-  // Écart cumulatif comme dans ton code original
+  // Écart cumulatif 
   long  ecart      = ticksD - ticksG;
   float derivee    = ecart - ecartPrecedent;
   int   correction = (int)((ecart * Kp) + (derivee * Kd));
@@ -276,7 +253,6 @@ void logf(const char* format, ...) {
 }
 
 // GESTION TELNET
-//
 // Vérifie si un nouveau client veut se connecter.
 // Si un ancien client est déjà là, on le déconnecte
 // pour accepter la nouvelle connexion.
@@ -290,28 +266,30 @@ void checkTelnet() {
 
 // UTILITAIRES I2C
 // writeReg : écrit un octet dans un registre
-// read16   : lit 2 octets consécutifs little-endian
-//   (LSB en premier, MSB en second)
+// read16   : lit 2 octets consécutifs
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
+  Wire.beginTransmission(addr); //un signal de "départ" à addr
+  Wire.write(reg); //Envoie le premier octet : l'adresse du registre interne où l'on veut écrire.
+  Wire.write(val); //Envoie le second octet : la donnée que l'on veut stocker.
+  Wire.endTransmission(); //Signale la fin de la transaction.
 }
 
+//le protocole I2C ne transporte que 8 bits à la fois. On doit donc lire deux octets et les "recoller".
 int16_t read16(uint8_t addr, uint8_t reg) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg | 0x80);   // bit 7 à 1 → auto-incrément d'adresse
-  Wire.endTransmission(false);
+  Wire.beginTransmission(addr); //Début de la communication avec le composant
+  Wire.write(reg | 0x80);   // bit 7 à 1 → auto-incrément d'adresse, permet lire registres suivant sans avoir à redonner l'adresse
+  Wire.endTransmission(false); // on envoi un restart
   Wire.requestFrom(addr, (uint8_t)2);
-  uint8_t lo = Wire.read();
-  uint8_t hi = Wire.read();
-  return (int16_t)(hi << 8 | lo);
+  uint8_t lo = Wire.read(); //On lit le premier octet reçu (le poids faible, LSB)
+  uint8_t hi = Wire.read();//On lit le deuxième octet reçu (le poids fort, MSB)
+  return (int16_t)(hi << 8 | lo); //On "recolle" les morceaux :
+  //On décale l'octet de poids fort de 8 crans vers la gauche (il devient les 8 bits du haut).
+  //On fusionne avec l'octet de poids faible (les 8 bits du bas).
 }
 
 // INIT MAGNÉTOMÈTRE LIS3MDL
-// CTRL1 0x70 : ultra-haute performance XY, ODR 10Hz
-// CTRL2 0x00 : pleine échelle ±4 gauss
+// CTRL1 0x70 : gère vitesse  et performace axe X et Y 
+// CTRL2 0x00 : pleine échelle ±4 gauss (+ grosse sensibiltée du champ)
 // CTRL3 0x00 : mode de mesure continu
 // CTRL4 0x0C : ultra-haute performance Z
 void initLIS3MDL() {
@@ -322,7 +300,7 @@ void initLIS3MDL() {
   logf("LIS3MDL initialise\n");
 }
 
-// CALCUL DE VITESSE — appelé dans le loop()
+// CALCUL DE VITESSE 
 //
 // Toutes les INTERVALLE_VITESSE_MS ms, on lit les ticks
 // accumulés depuis la dernière mesure et on calcule :
@@ -330,10 +308,7 @@ void initLIS3MDL() {
 //   ticks/s  = delta_ticks / dt
 //   cm/s     = (ticks/s) × CM_PAR_TICK
 //   RPM      = (ticks/s) / TICKS_PAR_TOUR × 60
-//
-// On repart de la valeur courante (pas de remise à zéro)
-// pour ne pas interférer avec les autres utilisations
-// des compteurs (ticks GUI, PD futur, etc.)
+
 void calculerVitesse() {
   if (millis() - tDerniereVit < INTERVALLE_VITESSE_MS) return;
 
@@ -679,7 +654,6 @@ void appliquerCommande() {
 
 
 // GESTIONNAIRES DU SERVEUR WEB
-
 // Envoie la page HTML au navigateur
 void handleRoot() {
   server.send_P(200, "text/html", PAGE_HTML);
@@ -706,24 +680,23 @@ void handleCmd() {
   server.send(200, "text/plain", "ok");
 }
 
-// Retourne le cap calibré en JSON (/cap)
-// Applique les offsets et scales mesurés lors de la calibration
-// pour obtenir un angle fiable entre 0° et 360°.
+// Retourne le cap calibré en JSON 
+// Applique les offsets et scales mesurés lors de la calibration fait dans un autre code
 // -ny corrige l'inversion physique de l'axe Y du LIS3MDL
-// par rapport à la convention boussole standard.
 void handleCap() {
-  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
-  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L); //on lit le registre de x
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2); //on lit le registre de y ( vu que c'est deux octets + loin on fait + 2)
 
   // Application de la calibration hard iron + soft iron
-  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE;
-  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
+  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE; //on soustrait l'offset calculé dans un autre code
+  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE; // on divise par scale, qui est la différence de si on veut tracer un cercle parfait entre x et y
 
   // atan2 donne un angle entre -π et +π → on ramène à 0°-360°
   float capRad = atan2(-ny, nx);
   int cap = (int)(capRad * 180.0 / PI);
   if (cap < 0) cap += 360;
 
+  //envoi de la réponse au web
   server.send(200, "application/json", "{\"cap\":" + String(cap) + "}");
 }
 
@@ -780,23 +753,23 @@ void setup() {
   ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
   ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
 
-  // Encodeurs : INPUT_PULLUP évite les fausses lectures
+  // Encodeurs : INPUT_PULLUP évite les fausses lectures ( active une résistance interne aux hypersensibilitées)
   pinMode(ENC_D_CH_A, INPUT_PULLUP);
   pinMode(ENC_G_CH_A, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
 
-  // WiFi — doit démarrer AVANT le Telnet et le WebServer
+  // WiFi démarre
   WiFi.softAP(ssid, password);
 
-  // Telnet sur port 23 : Serial Monitor sans fil
-  // → dans platformio.ini : monitor_port = socket://192.168.4.1:23
+  // Telnet : Serial Monitor sans fil
   telnetServer.begin();
   telnetServer.setNoDelay(true);
 
-  // OTA : permet de téléverser le code en WiFi
+  // OTA 
   ArduinoOTA.begin();
 
+  // démarrage de la pae de navigation
   server.on("/",            handleRoot);
   server.on("/cmd",         handleCmd);
   server.on("/cap",         handleCap);
@@ -818,7 +791,7 @@ void setup() {
   logf("GUI dispo sur : http://192.168.4.1\n");
   logf("Telnet        : socket://192.168.4.1:23\n\n");
 
-  // LED2 clignote une fois : setup terminé, robot prêt
+  // LED2 clignote une fois pour signaler setup terminé
   digitalWrite(LEDU2, HIGH);
   delay(300);
   digitalWrite(LEDU2, LOW);
@@ -829,6 +802,6 @@ void loop() {
   ArduinoOTA.handle();
   checkTelnet();
   appliquerCommande();
-  corrigerPD();       // ← s'exécute toutes les 5ms
+  corrigerPD();       // s'exécute toutes les 5ms
   calculerVitesse();
 }
