@@ -1,0 +1,635 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <SparkFunLSM6DS3.h> 
+
+#define LEDU1 25
+#define LEDU2 26
+
+#define EN_D 23
+#define EN_G  4
+
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// Compteurs pour le correcteur PD (remis à zéro souvent pour la ligne droite)
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+
+// Compteurs odométrie globale (gérés uniquement par la remise à zéro complète)
+volatile long ticksOdoDroit  = 0;
+volatile long ticksOdoGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  ticksOdoDroit++; }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; ticksOdoGauche++; }
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ADRESSES I2C CONFIGURÉES
+#define LIS3MDL_ADDR 0x1E  // Magnétomètre
+#define LSM6DS3_ADDR 0x6B  // IMU Gyroscope
+
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+// Instance de l'IMU LSM6DS3
+LSM6DS3 myIMU(I2C_MODE, LSM6DS3_ADDR);
+
+const int freq        = 5000;
+const int resolution  = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+const int PWR_DROIT_AV  = 200;   
+const int PWR_GAUCHE_AV = 208;   
+const int PWR_DROIT_AR  = 194;   
+const int PWR_GAUCHE_AR = 200;
+
+const float TICKS_PAR_TOUR = 1050.0;
+const float DIAM_ROUE_CM   = 9.0;
+const float CIRCONF_CM     = PI * DIAM_ROUE_CM;      
+const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR; 
+
+// CONFIGURATION DU REPERE CARTESIEN
+const float DISTANCE_MI_ENTRAXE_STYLO = 13.10;
+float Centre_Robot_X = -13.10; // Initialisé à la position d'origine du robot
+float Centre_Robot_Y = 0.0;
+float capGlobal = 0.0; 
+float capGlobalPrev = 0.0; 
+float x_stylo = 0.0;   
+float y_stylo = 0.0;   
+
+const int INTERVALLE_VITESSE_MS = 200;
+float vitesseDcms  = 0.0;   
+float vitesseGcms  = 0.0;   
+
+long     pasDroitPrev   = 0;
+long     pasGauchePrev  = 0;
+uint32_t tDerniereVit   = 0;
+
+long     pasDroitOdoPrev  = 0;
+long     pasGaucheOdoPrev = 0;
+uint32_t tDerniereOdo     = 0;
+
+// VARIABLES FILTRE DE KALMAN & GYRO
+float gyroBiasZ   = 0.0;
+uint32_t tDernierKalman = 0;
+
+// Structure mathématique pour le filtre de Kalman 1D (Lacet / Yaw)
+struct Kalman1D {
+  float Q_angle = 0.001f;  
+  float Q_bias  = 0.003f;  
+  float R_measure = 0.03f; 
+
+  float angle = 0.0f; 
+  float bias  = 0.0f; 
+  float P[2][2] = {{0, 0}, {0, 0}};
+
+  float update(float newAngle, float newRate, float dt) {
+    // Étape 1 : Prédiction (Gyro)
+    float rate = newRate - bias;
+    angle += dt * rate;
+
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    // Étape 2 : Correction (Mag)
+    float S = P[0][0] + R_measure;
+    float K[2]; 
+    K[0] = P[0][0] / S;
+    K[1] = P[1][0] / S;
+
+    float y = newAngle - angle;
+    if (y > 180.0f)  y -= 360.0f;
+    if (y < -180.0f) y += 360.0f;
+
+    angle += K[0] * y;
+    bias  += K[1] * y;
+
+    float P00_temp = P[0][0];
+    float P01_temp = P[0][1];
+
+    P[0][0] -= K[0] * P00_temp;
+    P[0][1] -= K[0] * P01_temp;
+    P[1][0] -= K[1] * P00_temp;
+    P[1][1] -= K[1] * P01_temp;
+
+    if (angle >= 360.0f) angle -= 360.0f;
+    if (angle < 0.0f)    angle += 360.0f;
+
+    return angle;
+  }
+};
+
+Kalman1D fKalman;
+
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+WebServer server(80);
+
+String commandeEnCours = "stop";
+
+// Étalonnage du Magnétomètre
+const float CALIB_X_OFFSET = -2045.0;
+const float CALIB_Y_OFFSET =   654.0;
+const float CALIB_X_SCALE  =  1857.0;
+const float CALIB_Y_SCALE  =  1922.0;
+
+uint32_t tDerniereCorr = 0;
+const float Kp = 0.8;   
+const float Kd = 0.3;   
+long ecartPrecedent  = 0;
+
+void logf(const char* format, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  Serial.print(buf);
+  if (telnetClient && telnetClient.connected())
+    telnetClient.print(buf);
+}
+
+void checkTelnet() {
+  if (telnetServer.hasClient()) {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+    telnetClient = telnetServer.available();
+  }
+}
+
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission(); 
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); Wire.write(reg | 0x80); Wire.endTransmission(false); 
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read(); uint8_t hi = Wire.read();
+  return (int16_t)(hi << 8 | lo); 
+}
+
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x7E); // Boosté à 80 Hz, Ultra-haute performance
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00); // ±4 gauss
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00); // Mode continu
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C); // Axe Z Ultra-haute performance
+  logf("LIS3MDL (Mag) configure a 80Hz (Ultra-Performance)\n");
+}
+
+void calibrerGyro() {
+  long somme = 0;
+  int echantillons = 300;
+  logf("Calibration Gyro... LAISSER LE ROBOT IMMOBILE\n");
+  for (int i = 0; i < echantillons; i++) {
+    somme += myIMU.readRawGyroZ();
+    delay(4);
+  }
+  gyroBiasZ = (float)somme / echantillons;
+  logf("Biais Gyro Z calcule et soustrait : %.2f\n", gyroBiasZ);
+}
+
+float obtenirCapMagnetometre() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+
+  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE;
+  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
+
+  float capRad = atan2(-ny, nx);
+  float cap = capRad * 180.0 / PI;
+  if (cap < 0) cap += 360.0;
+  return cap;
+}
+
+void executerFiltreKalman() {
+  uint32_t maintenant = millis();
+  float dt = (maintenant - tDernierKalman) / 1000.0f;
+  if (dt < 0.005f) return; 
+  tDernierKalman = maintenant;
+
+  // 1. Lecture de la vitesse angulaire (Gyro Z)
+  float gyroBrutZ = myIMU.readRawGyroZ();
+  float gyroCorrige = gyroBrutZ - gyroBiasZ;
+  float vitesseAngulaireZ = gyroCorrige * 4.375f / 1000.0f; // Conversion en °/s
+
+  // Note : Si la boussole tourne à l'envers lors des rotations, décommente la ligne ci-dessous :
+  // vitesseAngulaireZ = -vitesseAngulaireZ;
+
+  // 2. Lecture du cap absolu (Mag)
+  float capMag = obtenirCapMagnetometre();
+
+  // 3. Fusion de Kalman
+  capGlobal = fKalman.update(capMag, vitesseAngulaireZ, dt);
+}
+
+// REINITIALISATION DU SYSTEME CARTESIEN (HOME)
+void reinitialiserRepereCartesien() {
+  noInterrupts();
+  pasDroit = 0; 
+  pasGauche = 0;
+  ticksOdoDroit = 0; 
+  ticksOdoGauche = 0;
+  interrupts();
+
+  pasDroitPrev = 0; 
+  pasGauchePrev = 0;
+  pasDroitOdoPrev = 0; 
+  pasGaucheOdoPrev = 0;
+
+  // Configuration avec la position initiale fixe au lieu de 0.0
+  Centre_Robot_X = -13.10; 
+  Centre_Robot_Y = 0.0;
+
+  float capRad = capGlobal * PI / 180.0;
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capRad);
+
+  logf("[RESET] Repere cartesian initialise a la position de depart (-13.10, 0).\n");
+}
+
+void corrigerPD() {
+  if (commandeEnCours != "avancer" && commandeEnCours != "reculer") return;
+  if (millis() - tDerniereCorr < 10) return;   
+  tDerniereCorr = millis();
+
+  noInterrupts();
+  long ticksD = pasDroit; long ticksG = pasGauche;
+  interrupts();
+
+  long  ecart      = ticksD - ticksG;
+  float derivee    = ecart - ecartPrecedent;
+  int   correction = (int)((ecart * Kp) + (derivee * Kd));
+  ecartPrecedent   = ecart;
+
+  int pwrD = constrain(PWR_DROIT_AV - correction, 0, 255);
+  int pwrG = constrain(PWR_GAUCHE_AV + correction, 0, 255);
+
+  ledcWrite(canalDroit,  pwrD);
+  ledcWrite(canalGauche, pwrG);
+}
+
+void calculerVitesse() {
+  if (millis() - tDerniereVit < INTERVALLE_VITESSE_MS) return;
+  float dt = (millis() - tDerniereVit) / 1000.0;
+  tDerniereVit = millis();
+
+  noInterrupts();
+  long d = pasDroit; long g = pasGauche;
+  interrupts();
+
+  float ticksParSecD = (d - pasDroitPrev)  / dt;
+  float ticksParSecG = (g - pasGauchePrev) / dt;
+  pasDroitPrev  = d; pasGauchePrev = g;
+
+  vitesseDcms = ticksParSecD * CM_PAR_TICK;
+  vitesseGcms = ticksParSecG * CM_PAR_TICK;
+}
+
+void mettreAJourOdometrie() {
+  if (millis() - tDerniereOdo < 10) return; 
+  tDerniereOdo = millis();
+
+  noInterrupts();
+  long actuelsD = ticksOdoDroit; long actuelsG = ticksOdoGauche;
+  interrupts();
+
+  long deltaTicksD = actuelsD - pasDroitOdoPrev;
+  long deltaTicksG = actuelsG - pasGaucheOdoPrev;
+  pasDroitOdoPrev  = actuelsD; pasGaucheOdoPrev = actuelsG;
+
+  float deltaDDroit  = (float)deltaTicksD * CM_PAR_TICK;
+  float deltaDGauche = (float)deltaTicksG * CM_PAR_TICK;
+  float deltaDCentre = (deltaDDroit + deltaDGauche) / 2.0;
+
+  float angleMoyenDeg = (capGlobalPrev + capGlobal) / 2.0;
+  capGlobalPrev = capGlobal;
+
+  float capRad = angleMoyenDeg * PI / 180.0;
+
+  Centre_Robot_X += deltaDCentre * cos(capRad);
+  Centre_Robot_Y += deltaDCentre * sin(capRad);
+
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capRad);
+}
+
+// INTERFACE GRAPHIQUE WEB HTML
+const char PAGE_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Draw_GOAAAT</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: #111; color: #fff; font-family: sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh; gap: 16px; padding: 20px;
+    }
+    h1 { font-size: 1.4rem; letter-spacing: 2px; color: #0af; }
+    #status { font-size: 0.85rem; color: #888; height: 20px; }
+    .grid {
+      display: grid; grid-template-columns: repeat(3, 90px); grid-template-rows: repeat(3, 90px); gap: 10px;
+      touch-action: none; user-select: none;
+    }
+    .btn {
+      background: #222; border: 2px solid #444; border-radius: 14px; color: #fff; font-size: 2rem; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; transition: background 0.1s;
+    }
+    .btn:active, .btn.pressed { background: #0af; border-color: #0af; color: #000; transform: scale(0.93); }
+    .btn.danger:active, .btn.danger.pressed { background: #f44; border-color: #f44; }
+    #btn-vag  { grid-column: 1; grid-row: 1; }
+    #btn-av   { grid-column: 2; grid-row: 1; }
+    #btn-vad  { grid-column: 3; grid-row: 1; }
+    #btn-rg   { grid-column: 1; grid-row: 2; }
+    #btn-stop { grid-column: 2; grid-row: 2; }
+    #btn-rd   { grid-column: 3; grid-row: 2; }
+    #btn-veg  { grid-column: 1; grid-row: 3; }
+    #btn-re   { grid-column: 2; grid-row: 3; }
+    #btn-ved  { grid-column: 3; grid-row: 3; }
+    .data-box { background: #1a1a1a; border: 1px solid #333; border-radius: 16px; padding: 14px 24px; display: flex; flex-direction: column; gap: 10px; width: 290px; }
+    .data-box h2 { font-size: 0.9rem; letter-spacing: 1px; }
+    .data-box h2.vert   { color: #0f8; }
+    .data-box h2.bleu   { color: #0af; }
+    .data-box h2.orange { color: #fa0; }
+    .data-box h2.rose   { color: #f0f; }
+    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+    .data-label { font-size: 0.78rem; color: #888; align-self: center; }
+    .data-val { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
+    .data-val.robot  { color: #0f8; }
+    .data-val.stylo  { color: #f0f; }
+    .data-val.droite { color: #0af; }
+    .data-val.gauche { color: #fa0; }
+    #compass-wrap { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+    #compass-ring { width: 110px; height: 110px; border: 2px solid #333; border-radius: 50%; display: flex; align-items: center; justify-content: center; position: relative; }
+    #compass-ring::before { content:'N'; position:absolute; top:5px; font-size:0.75rem; color:#f44; font-weight:bold; }
+    #needle { width: 4px; height: 86px; position: absolute; transform-origin: center center; transition: transform 0.1s linear; display: flex; flex-direction: column; }
+    .needle-n { width:4px; height:43px; background:#f44; border-radius:2px 2px 0 0; }
+    .needle-s { width:4px; height:43px; background:#555; border-radius:0 0 2px 2px; }
+    #cap-display { font-size: 2rem; font-weight: bold; color: #fff; letter-spacing: 2px; }
+    #btn-reset-ticks { background: #222; border: 1px solid #555; border-radius: 8px; color: #aaa; font-size: 0.75rem; padding: 5px 12px; cursor: pointer; align-self: center; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Draw_GOAAAT</h1>
+  <div id="status">En attente...</div>
+
+  <div class="grid">
+    <div class="btn" id="btn-vag"  data-cmd="vag">↖</div>
+    <div class="btn" id="btn-av"   data-cmd="avancer">⬆</div>
+    <div class="btn" id="btn-vad"  data-cmd="vad">↗</div>
+    <div class="btn" id="btn-rg"   data-cmd="rotation_gauche">↺</div>
+    <div class="btn danger" id="btn-stop" data-cmd="stop">■</div>
+    <div class="btn" id="btn-rd"   data-cmd="rotation_droite">↻</div>
+    <div class="btn" id="btn-veg"  data-cmd="veg">↙</div>
+    <div class="btn" id="btn-re"   data-cmd="reculer">⬇</div>
+    <div class="btn" id="btn-ved"  data-cmd="ved">↘</div>
+  </div>
+
+  <div class="data-box">
+    <h2 class="rose">📍 COORDONNÉES (mm)</h2>
+    <div class="data-grid">
+      <span class="data-label">Robot X</span> <span class="data-val robot" id="rob-x">—</span>
+      <span class="data-label">Robot Y</span> <span class="data-val robot" id="rob-y">—</span>
+      <span class="data-label">Stylo X</span> <span class="data-val stylo" id="sty-x">—</span>
+      <span class="data-label">Stylo Y</span> <span class="data-val stylo" id="sty-y">—</span>
+    </div>
+  </div>
+
+  <div class="data-box">
+    <h2 class="vert">🧭 ORIENTATION (KALMAN)</h2>
+    <div id="compass-wrap">
+      <div id="compass-ring">
+        <div id="needle"><div class="needle-n"></div><div class="needle-s"></div></div>
+      </div>
+      <div id="cap-display">—°</div>
+    </div>
+  </div>
+
+  <div class="data-box">
+    <h2 class="orange">⚡ VITESSE ROUES</h2>
+    <div class="data-grid">
+      <span class="data-label">Droite (cm/s)</span> <span class="data-val droite" id="vit-d-cms">—</span>
+      <span class="data-label">Gauche (cm/s)</span> <span class="data-val gauche" id="vit-g-cms">—</span>
+    </div>
+  </div>
+
+  <div class="data-box">
+    <h2 class="bleu">🔢 TICKS ENCODEURS</h2>
+    <div class="data-grid">
+      <span class="data-label">Roue droite</span> <span class="data-val droite" id="tick-d">—</span>
+      <span class="data-label">Roue gauche</span> <span class="data-val gauche" id="tick-g">—</span>
+    </div>
+    <button id="btn-reset-ticks">↺ Force Home Manual</button>
+  </div>
+
+  <script>
+    function send(cmd) { fetch('/cmd?action=' + cmd).catch(() => {}); }
+    
+    document.querySelectorAll('.btn').forEach(btn => {
+      const cmd = btn.dataset.cmd;
+      btn.addEventListener('touchstart',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); }, { passive: false });
+      btn.addEventListener('touchend',    e => { e.preventDefault(); btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+      btn.addEventListener('mousedown',  e => { e.preventDefault(); btn.classList.add('pressed'); send(cmd); });
+      btn.addEventListener('mouseup',    () => { btn.classList.remove('pressed'); if (cmd !== 'stop') send('stop'); });
+    });
+
+    setInterval(async () => {
+      try {
+        const r = await fetch('/pos'); const d = await r.json();
+        document.getElementById('rob-x').textContent = d.rx.toFixed(1);
+        document.getElementById('rob-y').textContent = d.ry.toFixed(1);
+        document.getElementById('sty-x').textContent = d.sx.toFixed(1);
+        document.getElementById('sty-y').textContent = d.sy.toFixed(1);
+      } catch(e) {}
+    }, 150);
+
+    setInterval(async () => {
+      try {
+        const r = await fetch('/cap'); const d = await r.json();
+        document.getElementById('cap-display').textContent = d.cap + '°';
+        document.getElementById('needle').style.transform = 'rotate(' + d.cap + 'deg)';
+      } catch(e) {}
+    }, 150);
+
+    setInterval(async () => {
+      try {
+        const r = await fetch('/vitesse'); const d = await r.json();
+        document.getElementById('vit-d-cms').textContent = d.dcms.toFixed(1);
+        document.getElementById('vit-g-cms').textContent = d.gcms.toFixed(1);
+      } catch(e) {}
+    }, 200);
+
+    setInterval(async () => {
+      try {
+        const r = await fetch('/ticks'); const d = await r.json();
+        document.getElementById('tick-d').textContent = d.droite;
+        document.getElementById('tick-g').textContent = d.gauche;
+      } catch(e) {}
+    }, 250);
+
+    document.getElementById('btn-reset-ticks').addEventListener('click', () => { fetch('/ticks/reset'); });
+  </script>
+</body>
+</html>
+)rawhtml";
+
+void handleRoot() { server.send_P(200, "text/html", PAGE_HTML); }
+
+void handleCmd() {
+  if (server.hasArg("action")) {
+    String nouvelleCommande = server.arg("action");
+    if (nouvelleCommande != commandeEnCours) {
+      noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+      ecartPrecedent = 0;
+      
+      // REINITIALISATION AUTOMATIQUE SUPPRIMÉE ICI POUR CONSERVER L'ODOMÉTRIE EN CONTINU
+    }
+    commandeEnCours = nouvelleCommande;
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+void handleCap() {
+  server.send(200, "application/json", "{\"cap\":" + String((int)capGlobal) + "}");
+}
+
+void handlePositions() {
+  char json[120];
+  snprintf(json, sizeof(json), "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f}",
+    Centre_Robot_X * 10.0, Centre_Robot_Y * 10.0, x_stylo * 10.0, y_stylo * 10.0);
+  server.send(200, "application/json", json);
+}
+
+void handleVitesse() {
+  char json[120];
+  snprintf(json, sizeof(json), "{\"dcms\":%.1f,\"gcms\":%.1f}", vitesseDcms, vitesseGcms);
+  server.send(200, "application/json", json);
+}
+
+void handleTicks() {
+  noInterrupts(); long d = ticksOdoDroit; long g = ticksOdoGauche; interrupts();
+  server.send(200, "application/json", "{\"droite\":" + String(d) + ",\"gauche\":" + String(g) + "}");
+}
+
+void handleTicksReset() {
+  reinitialiserRepereCartesien();
+  server.send(200, "text/plain", "ok");
+}
+
+void appliquerCommande() {
+  if (commandeEnCours == "avancer") {
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+  } else if (commandeEnCours == "reculer") {
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+  } else if (commandeEnCours == "rotation_gauche") {
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+  } else if (commandeEnCours == "rotation_droite") {
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+  } else {
+    ledcWrite(canalDroit,  0);
+    ledcWrite(canalGauche, 0);
+  }
+  digitalWrite(LEDU2, commandeEnCours != "stop" ? HIGH : LOW);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  digitalWrite(LEDU1, HIGH);
+
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_D_CH_A, INPUT_PULLUP); pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  WiFi.softAP(ssid, password);
+  telnetServer.begin(); telnetServer.setNoDelay(true);
+  ArduinoOTA.begin();
+
+  server.on("/",            handleRoot);
+  server.on("/cmd",         handleCmd);
+  server.on("/cap",         handleCap);
+  server.on("/pos",         handlePositions); 
+  server.on("/vitesse",     handleVitesse);
+  server.on("/ticks",       handleTicks);
+  server.on("/ticks/reset", handleTicksReset);
+  server.begin();
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000); // Mode I2C Rapide
+  
+  // Initialisation des Capteurs
+  initLIS3MDL();
+  
+  if (myIMU.begin() != 0) {
+    logf("ERREUR CRITIQUE : LSM6DS3 introuvable sur 0x6B\n");
+  } else {
+    logf("LSM6DS3 (Gyro) connecte avec succes.\n");
+    calibrerGyro();
+  }
+
+  // Configuration initiale de Kalman basée sur la boussole de départ
+  fKalman.angle = obtenirCapMagnetometre();
+  capGlobal = fKalman.angle;
+  capGlobalPrev = capGlobal;
+  
+  tDernierKalman = millis(); tDerniereVit = millis(); tDerniereOdo = millis();
+
+  // Premier Home automatique au démarrage avec les coordonnées physiques réelles
+  reinitialiserRepereCartesien();
+}
+
+void loop() {
+  server.handleClient();
+  ArduinoOTA.handle();
+  checkTelnet();
+  
+  // 1. Mise à jour de la fusion de capteurs (Haute Fréquence)
+  executerFiltreKalman(); 
+
+  // 2. Gestion moteurs, asservissement et calculs de trajectoires
+  appliquerCommande();
+  corrigerPD();       
+  calculerVitesse();  
+  mettreAJourOdometrie(); 
+}
