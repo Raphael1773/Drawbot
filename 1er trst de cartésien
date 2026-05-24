@@ -1,31 +1,38 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <WiFi.h>
+#include <WiFiServer.h>
 #include <WebServer.h>
 #include <Wire.h>
 
-// User led
-//pour savoir si la carte marche ou non 
+// LEDs utilisateur
+// LED1 : carte alimentée et code actif
+// LED2 : commande moteur en cours
+
 #define LEDU1 25
 #define LEDU2 26
 
 // Enable moteurs droit et gauche
-// décident de la puissance envoyé au moteur: envoi une fréquence
-// si impulsion large, moteur recoit beaucoup d'énergie donc puissance élevé donc tourne vite
-// si impulsion courte, moteur recoit peu d'énergie donc peu de puissance donc tourne lentement
-// Lorsqu'on utilise la pin, on déclare 3 chose:
-//- la Fréquence: correspond à l'interrupteur de l'esp s'ouvre et se ferme 
-//- la Résolution: correspond au nombre de bit sur la quelle on découpe la puissance ( 8 bit = coupé en 256 positions )
-//- le rapport cyclique: c'est ce qu'on change pendnat que le robot roule, c'est le temps pendant lequel le courant reste allumé
-// si on met 200, on sera à 80% de puissance
+// Décident de la puissance envoyée au moteur : envoie une fréquence
+// Si impulsion large, moteur reçoit beaucoup d'énergie → tourne vite
+// Si impulsion courte, moteur reçoit peu d'énergie → tourne lentement
+// Lorsqu'on utilise la pin, on déclare 3 choses :
+//   - la Fréquence       : vitesse à laquelle l'interrupteur de l'ESP s'ouvre/se ferme
+//   - la Résolution      : nombre de bits sur lequel on découpe la puissance (8 bits = 256 positions)
+//   - le Rapport cyclique: ce qu'on change pendant que le robot roule (temps pendant lequel le courant reste allumé)
+//     ex : si on met 200, on sera à ~80% de puissance
 #define EN_D 23
-#define EN_G 4
+#define EN_G  4
 
-// Commande PWM moteur droit
+// Pins de direction moteur droit
+// IN1=LOW  / IN2=HIGH → sens avant
+// IN1=HIGH / IN2=LOW  → sens arrière
 #define IN_1_D 19
 #define IN_2_D 18
 
-// Commande PWM moteur gauche
+// Pins de direction moteur gauche
+// IN1=HIGH / IN2=LOW  → sens avant
+// IN1=LOW  / IN2=HIGH → sens arrière
 #define IN_1_G 17
 #define IN_2_G 16
 
@@ -41,203 +48,585 @@
 #define ENC_D_CH_A 27
 #define ENC_D_CH_B 14
 
-// I2C
-// - SDA (Serial Data) : La ligne qui transporte les bits de données.
-// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
-#define SDA 21
-#define SCL 22
-
-//Variable du Kd
-// Amortissement de la correction (Dérivé)
-//elle évite une correction trop brusque de la part du Kp
-long ecartPrecedent = 0; 
-float Kd = 0.8;
-
-//Variables du Kp
-// C'est la puissance de réaction immédiate. 
-//Plus l'écart entre la cible et la position actuelle est grand, plus Kp va pousser fort pour corriger l'erreur  
-float Kp = 1.5; 
-
-//Configuration Wifi
-const char* ssid = "Draw_GOAAAT";
-const char* password = "12345678";
-
-//Paramètres de bases défini
-const int freq = 5000; // fréquence de 5000 Hertz pour l'ESP32
-const int resolution = 8;//nombre de bits sur lequel est ciompté la puissance 
-const int canalDroit = 0;
-const int canalGauche = 1;
-
-volatile long pasDroit = 0;
+//Constantes de comptage des ticks des moteurs gauche et droite
+volatile long pasDroit  = 0;
 volatile long pasGauche = 0;
 
-//Fonctions d'interruptions
-// Fais en sorte que les ordres pour compter le nombre de pas des moteurs n'aillent pas dans le flash mais dans la RAM pour aller plus vite 
-void IRAM_ATTR ISR_Droit() { pasDroit++; }
+//FONCTIONS D'INTERRUPTION
+//force la fonction en RAM plutôt qu'en flash
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
 void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 
-//Se met en false pour arrêter le code une fois celui ci terminé
-bool testEnCours = true;
+//I2C
+// - SDA (Serial Data) : La ligne qui transporte les bits de données.
+// - SCL (Serial Clock) : Le signal d'horloge qui synchronise l'envoi des données.
+#define SDA_PIN 21
+#define SCL_PIN 22
 
-//Valeurs physiques du robot pour ne pas les oubliés
-const float cm_par_ticks = 0.03;  // 30cm / 1000 ticks
-const float entraxe = 6.62;       // c'est la dimension de la plateforme principale du robot où repose les moteurs
-const float Offset_stylo = 12.0;
-const float mi_entrax= 3.31;            // Offset stylo 12cm, c'est de combien de cm le stylo il est avancé en ligne droite par rapport au centre des deux roues
+// Magnétomètre LIS3MDL — communication I2C
+//
+// Le LIS3MDL  mesure le champ magnétique.
+// On lui parle via le protocole I2C : on envoie l'adresse
+// du capteur, puis le numéro du registre qu'on veut lire
+// ou écrire, comme des cases mémoire numérotées à l'intérieur
+// de la puce.
+//
+// - 0x1E : adresse I2C du capteur
+//   - sans ça l'ESP32 ne sait pas à qui envoyer les données
+//
+// - CTRL1 à CTRL4 : registres de configuration
+//   - ce sont des cases mémoire internes au capteur
+//   - on y écrit des valeurs au démarrage pour lui dire :
+//     - à quelle fréquence mesurer (10 fois par seconde ici)
+//     - avec quelle précision (en gauss)
+//     - de mesurer en continu sans qu'on le redemande
+//
+// - OUT_X_L (0x28) : premier registre de données
+//   case où le capteur écrit ses mesures
+//   à partir de cette adresse, 6 octets se suivent :
+//       0x28-0x29 → valeur X (2 octets)
+//       0x2A-0x2B → valeur Y (2 octets)
+//       0x2C-0x2D → valeur Z (2 octets)
+//   - on les lit d'un coup via read16() trois fois de suite
 
-//Valuers pour lier le plan polaire de la base du robot au plan cartésien du stylo
-//on fait donc juste de la trigo sur un triangle rectangle classique
-//on sait donc grâce à ca le décalage entre une des roue et le stylo
-const float angle_tan_base_stylo_droite = atan2( Offset_stylo, mi_entrax); // si on considère que l'anngle positif est pour la roue droite
-const float angle_tan_base_stylo_gauche=atan2(Offset_stylo, (-1)*mi_entrax);//alors l'angle pour la roue gauche est négatif
+#define LIS3MDL_ADDR 0x1E
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
 
-//Maintenant on va  définir les points que devra suivre le robot en ligne droite entre les points
-float mesPoints[][2] = { {20.0, 0.0}, {20.0, 20.0}, {0.0, 20.0}, {0.0, 0.0} }; 
-float pointActuel[2] = {0.0, 0.0};//c'est la position de base dans leplan cartésien du stylo
-const int nbPoints = 4;
-float angle_Robot_actuel = 0;
+// PARAMÈTRES PWM
+// Au lieu d'envoyer une tension variable, on envoie un signal
+// qui s'allume et s'éteint très rapidement. C'est le rapport
+// entre le temps allumé et le temps éteint qui détermine
+// la puissance reçue par le moteur.
+//
+// - freq (5000 Hz) : vitesse à laquelle le signal s'allume et s'éteint.
+//
+// - resolution (8 bits) : précision du réglage de puissance.
+//
+//  canalDroit / canalGauche :gérer signaux reçu des moteurs
+//   Canal 0 → moteur droit / Canal 1 → moteur gauche
 
-//ici on créé la constante de conversion du plan du stylo vers le plan polaire du chassis
-// Distance réelle entre une roue et la pointe du stylo, ca correspond à l'hypothénus du triangle 
-const float dist_roue_stylo = sqrt(sq(Offset_stylo) + sq(mi_entrax));
-// là c'est la même chose mais en coordonnées cartésiennes
-const float roue_D_rel[2] = {-12.0,  3.31}; // Roue Droite est derrière (-12) et à droite (+3.31)
-const float roue_G_rel[2] = {-12.0, -3.31}; // Roue Gauche est derrière (-12) et à gauche (-3.31)
+const int freq        = 5000;
+const int resolution  = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
 
-void Rotation_sur_stylo(float angleVouluRad) {
-    if (abs(angleVouluRad) < 0.05) return;
+// COMPENSATION DE VITESSE MOTEURS
+//suite a des tests empiriques
+const int PWR_DROIT_AV  = 200;   // avant   — référence
+const int PWR_GAUCHE_AV = 208;   // avant
+const int PWR_DROIT_AR  = 194;   // arrière — référence
+const int PWR_GAUCHE_AR = 200;
+const int PWR_FAIBLE    = 100;   // roue intérieure des virages
 
-    float distanceArc = angleVouluRad * dist_roue_stylo;
-    long ticksRotation = abs(distanceArc / cm_par_ticks);
+// GÉOMÉTRIE DE LA ROUE — pour le calcul de vitesse
+// roue de diamètre 90mm
+//1050 ticks pour faire un tour complet
+// CIRCONF_CM : distance parcourue en cm pour un tour complet
+//   = π × diamètre = π × 9 ≈ 28.27 cm
+//
+// CM_PAR_TICK : distance réelle parcourue par tick
+//   = circonférence / ticks par tour ≈ 0.0269 cm/tick
+const float TICKS_PAR_TOUR = 1050.0;
+const float DIAM_ROUE_CM   = 9.0;
+const float CIRCONF_CM     = PI * DIAM_ROUE_CM;      // ≈ 28.27 cm
+const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR; // ≈ 0.0269 cm/tick
 
-    pasDroit = 0; pasGauche = 0;
-    
-    // --- LA LOGIQUE DU PIVOT SUR STYLO ---
-    // Pour que le stylo reste fixe et que le robot tourne autour :
-    // Les deux roues doivent aller dans le MÊME SENS (Avant ou Arrière)
-    
-    if (angleVouluRad > 0) {
-        // Rotation GAUCHE : Le robot doit se déplacer vers la DROITE pour que le stylo pivote à gauche
-        // On fait avancer les deux moteurs (selon tes branchements IN1/IN2)
-        digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
-        digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
-    } else {
-        // Rotation DROITE : Le robot doit se déplacer vers la GAUCHE
-        // On fait reculer les deux moteurs
-        digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW); 
-        digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); 
-    }
+//CONANTES COORD CARTESIENNES
+const float MI_ENTRAXE = 3.3;
+const float ENTRAXE = 6.6;
+const float DISTANCE_MI_ENTRAXE_STYLO = 13.10;
+float Centre_Robot_X= -13.10;
+float Centre_Robot_Y = 0.0;
+float capGlobal = 0.0; 
+float capGlobalPrev = 0.0; // Stocke le cap du cycle précédent pour calculer le "cap moyen"
+float x_stylo = 0.0;   
+float y_stylo = 0.0;   
 
-    // Boucle de contrôle
-    while (abs(pasDroit) < ticksRotation) {
-        // On essaie de garder les deux roues synchronisées pour décrire l'arc
-        long ecart = abs(pasGauche) - abs(pasDroit);
-        int correction = ecart * Kp;
+// CALCUL DE VITESSE — variables internes
+// On mesure la vitesse toutes les INTERVALLE_VITESSE_MS ms
+// en comptant les ticks accumulés depuis la dernière mesure.
+//
+// vitesseD / vitesseG : vitesses calculées en cm/s et RPM,
+//   mises à jour périodiquement et lues par handleVitesse()
+const int INTERVALLE_VITESSE_MS = 200;
 
-        ledcWrite(canalDroit, 150); 
-        ledcWrite(canalGauche, constrain(150 - correction, 0, 255));
-        
-        yield();
-    }
-    
-    ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
-    delay(300);
+float vitesseDcms  = 0.0;   // vitesse roue droite  en cm/s
+float vitesseGcms  = 0.0;   // vitesse roue gauche  en cm/s
+float vitesseDrpm  = 0.0;   // vitesse roue droite  en RPM
+float vitesseGrpm  = 0.0;   // vitesse roue gauche  en RPM
+
+long     pasDroitPrev   = 0;
+long     pasGauchePrev  = 0;
+uint32_t tDerniereVit   = 0;
+
+// Variables dédiées à l'odométrie en continu (10ms)
+long     pasDroitOdoPrev  = 0;
+long     pasGaucheOdoPrev = 0;
+uint32_t tDerniereOdo     = 0;
+
+// WIFI
+
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+//TELNET
+// Permet de voir les logs sans fil, notamment
+// pendant la calibration magnétomètre.
+//
+// WiFiServer  : écoute les connexions entrantes
+// WiFiClient  : représente le PC connecté
+WiFiServer telnetServer(23);
+WiFiClient telnetClient;
+
+// Serveur HTTP (port 80) : sert la page HTML du GUI
+WebServer server(80);
+
+// Commande active : détermine ce que font les
+// moteurs dans le loop(). Vaut "stop" par défaut.
+String commandeEnCours = "stop";
+
+// CALIBRATION MAGNÉTOMÈTRE — valeurs mesurées
+//
+// En faisant tourner le robot à 360°, le magnéto
+// décrit une ellipse dans le plan X/Y.
+// On mesure ses extrêmes pour corriger deux biais :
+//
+//   xOffset/yOffset : centre de l'ellipse
+//     → compense le hard iron (champ parasite fixe
+//       créé par les moteurs, vis, batteries...)
+//
+//   xScale/yScale : rayon de l'ellipse sur chaque axe
+//     → compense le soft iron (déformation du champ
+//       par les matériaux proches du capteur)
+//
+// Formule appliquée dans handleCap() :
+//   nx  = (mx - xOffset) / xScale   → entre -1 et +1
+//   ny  = (my - yOffset) / yScale   → entre -1 et +1
+//   cap = atan2(-ny, nx) × 180/π    → 0° à 360°
+//
+// Résultat obtenu : Ratio X/Y = 1.03 ✓
+const float CALIB_X_OFFSET = -2045.0;
+const float CALIB_Y_OFFSET =   654.0;
+const float CALIB_X_SCALE  =  1857.0;
+const float CALIB_Y_SCALE  =  1922.0;
+
+
+uint32_t tDerniereCorr = 0;
+
+const float Kp = 0.8;   // moins agressif
+const float Kd = 0.3;   // moins d'amortissement aussi
+const int   INTERVALLE = 10;   // 10ms 
+
+
+// Variables globales — NE PAS remettre à zéro dans la boucle PD
+long ecartPrecedent  = 0;
+int  pwrDroitCourant  = 200;
+int  pwrGaucheCourant = 200;
+
+void corrigerPD() {
+
+  if (commandeEnCours != "avancer" && commandeEnCours != "reculer") return;
+  if (millis() - tDerniereCorr < 10) return;   // 10ms
+  tDerniereCorr = millis();
+
+
+  noInterrupts();
+  long ticksD = pasDroit;
+  long ticksG = pasGauche;
+  interrupts();
+
+  // Écart cumulatif 
+  long  ecart      = ticksD - ticksG;
+  float derivee    = ecart - ecartPrecedent;
+  int   correction = (int)((ecart * Kp) + (derivee * Kd));
+  ecartPrecedent   = ecart;
+
+  int pwrD = constrain(pwrDroitCourant - correction, 0, 255);
+  int pwrG = constrain(pwrGaucheCourant + correction, 0, 255);
+
+  ledcWrite(canalDroit,  pwrD);
+  ledcWrite(canalGauche, pwrG);
 }
 
-void avancerLigneDroite(float distanceCm) {
-    long ticksAfaire = distanceCm / cm_par_ticks;
-    pasDroit = 0; pasGauche = 0; ecartPrecedent = 0;
-
-    // Sens Avant (selon tes branchements)
-    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
-    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW); 
-
-    while (pasDroit < ticksAfaire) {
-        long ecart = pasGauche - pasDroit;
-        float derivee = ecart - ecartPrecedent;
-        int correction = (ecart * Kp) + (derivee * Kd);
-        ecartPrecedent = ecart;
-
-        ledcWrite(canalDroit, 200); // On met un peu plus de puissance pour les lignes droites
-        ledcWrite(canalGauche, constrain(200 - correction, 0, 255));
-
-        ArduinoOTA.handle();
-        yield();
-    }
-    // Stop net
-    ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
-    delay(200); // Petite pause pour stabiliser le stylo
+// FONCTION DE LOG 
+//
+// Envoie le message à la fois :
+//   - sur le port série USB (si câble branché)
+//   - au client Telnet connecté en WiFi
+void logf(const char* format, ...) {
+  char buf[128];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+  Serial.print(buf);
+  if (telnetClient && telnetClient.connected())
+    telnetClient.print(buf);
 }
 
-//Là c'est la fonction test pour voir si on arrive à dessiner le carré
-// On garde un seul paramètre : l'angle de départ
-void dessinerCarre(float angle_depart) {
-    // Initialisation de l'angle local au début du dessin
-    angle_Robot_actuel = angle_depart;
+// GESTION TELNET
+// Vérifie si un nouveau client veut se connecter.
+// Si un ancien client est déjà là, on le déconnecte
+// pour accepter la nouvelle connexion.
+void checkTelnet() {
+  if (telnetServer.hasClient()) {
+    if (telnetClient && telnetClient.connected())
+      telnetClient.stop();
+    telnetClient = telnetServer.available();
+  }
+}
 
-    for (int i = 0; i < nbPoints; i++) {
-        float cibleX = mesPoints[i][0];
-        float cibleY = mesPoints[i][1];
+// UTILITAIRES I2C
+// writeReg : écrit un octet dans un registre
+// read16   : lit 2 octets consécutifs
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); //un signal de "départ" à addr
+  Wire.write(reg); //Envoie le premier octet : l'adresse du registre interne où l'on veut écrire.
+  Wire.write(val); //Envoie le second octet : la donnée que l'on veut stocker.
+  Wire.endTransmission(); //Signale la fin de la transaction.
+}
 
-        // Étape A : Calcul du vecteur vers la cible
-        float dx = cibleX - pointActuel[0];
-        float dy = cibleY - pointActuel[1];
-        
-        float angleCible = atan2(dy, dx);
-        float distance = sqrt(dx*dx + dy*dy);
+//le protocole I2C ne transporte que 8 bits à la fois. On doit donc lire deux octets et les "recoller".
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); //Début de la communication avec le composant
+  Wire.write(reg | 0x80);   // bit 7 à 1 → auto-incrément d'adresse, permet lire registres suivant sans avoir à redonner l'adresse
+  Wire.endTransmission(false); // on envoi un restart
+  Wire.requestFrom(addr, (uint8_t)2);
+  uint8_t lo = Wire.read(); //On lit le premier octet reçu (le poids faible, LSB)
+  uint8_t hi = Wire.read();//On lit le deuxième octet reçu (le poids fort, MSB)
+  return (int16_t)(hi << 8 | lo); //On "recolle" les morceaux :
+  //On décale l'octet de poids fort de 8 crans vers la gauche (il devient les 8 bits du haut).
+  //On fusionne avec l'octet de poids faible (les 8 bits du bas).
+}
 
-        // Étape B : Pivot sur le stylo
-        float rotationNecessaire = angleCible - angle_Robot_actuel;
-        
-        // Normalisation de l'angle (pour prendre le chemin le plus court)
-        while (rotationNecessaire > PI)  rotationNecessaire -= 2 * PI;
-        while (rotationNecessaire < -PI) rotationNecessaire += 2 * PI;
+// INIT MAGNÉTOMÈTRE LIS3MDL
+// CTRL1 0x70 : gère vitesse  et performace axe X et Y 
+// CTRL2 0x00 : pleine échelle ±4 gauss (+ grosse sensibiltée du champ)
+// CTRL3 0x00 : mode de mesure continu
+// CTRL4 0x0C : ultra-haute performance Z
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x70);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+  logf("LIS3MDL initialise\n");
+}
 
-        Rotation_sur_stylo(rotationNecessaire);
-        angle_Robot_actuel = angleCible; 
+// CALCUL DE VITESSE 
+//
+// Toutes les INTERVALLE_VITESSE_MS ms, on lit les ticks
+// accumulés depuis la dernière mesure et on calcule :
+//
+//   ticks/s  = delta_ticks / dt
+//   cm/s     = (ticks/s) × CM_PAR_TICK
+//   RPM      = (ticks/s) / TICKS_PAR_TOUR × 60
 
-        // Étape C : Avance
-        avancerLigneDroite(distance);
+void calculerVitesse() {
+  if (millis() - tDerniereVit < INTERVALLE_VITESSE_MS) return;
 
-        // Mise à jour de la mémoire de position
-        pointActuel[0] = cibleX;
-        pointActuel[1] = cibleY;
-        
-        Serial.printf("Point atteint : X=%.2f, Y=%.2f\n", pointActuel[0], pointActuel[1]);
+  float dt = (millis() - tDerniereVit) / 1000.0;
+  tDerniereVit = millis();
+
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+
+  float ticksParSecD = (d - pasDroitPrev)  / dt;
+  float ticksParSecG = (g - pasGauchePrev) / dt;
+
+  pasDroitPrev  = d;
+  pasGauchePrev = g;
+
+  // Conversion en cm/s et RPM
+  vitesseDcms = ticksParSecD * CM_PAR_TICK;
+  vitesseGcms = ticksParSecG * CM_PAR_TICK;
+  vitesseDrpm = ticksParSecD / TICKS_PAR_TOUR * 60.0;
+  vitesseGrpm = ticksParSecG / TICKS_PAR_TOUR * 60.0;
+}
+
+// FONCTION D'ODOMÉTRIE ET DE LOCALISATION DU STYLO (10ms)
+// Calcule précisément le micro-déplacement linéaire du centre via la moyenne des roues
+// Projeté en X et Y grâce à l'angle du cap moyen mesuré par la boussole.
+void mettreAJourOdometrie() {
+  if (millis() - tDerniereOdo < 10) return; 
+  tDerniereOdo = millis();
+
+  // 1. Lecture sécurisée des encodeurs
+  noInterrupts();
+  long actuelsD = pasDroit;
+  long actuelsG = pasGauche;
+  interrupts();
+
+  // 2. Différence de ticks sur l'intervalle de 10ms
+  long deltaTicksD = actuelsD - pasDroitOdoPrev;
+  long deltaTicksG = actuelsG - pasGaucheOdoPrev;
+
+  pasDroitOdoPrev  = actuelsD;
+  pasGaucheOdoPrev = actuelsG;
+
+  // 3. Conversion du déplacement de chaque roue en cm
+  float deltaDDroit  = (float)deltaTicksD * CM_PAR_TICK;
+  float deltaDGauche = (float)deltaTicksG * CM_PAR_TICK;
+
+  // 4. Distance réelle parcourue par le CENTRE du robot (Moyenne)
+  float deltaDCentre = (deltaDDroit + deltaDGauche) / 2.0;
+
+  // 5. Calcul géométrique du cap moyen durant l'intervalle (Annule l'erreur de virage)
+  float angleMoyenDeg = (capGlobalPrev + capGlobal) / 2.0;
+  capGlobalPrev = capGlobal; // Sauvegarde pour le cycle suivant
+
+  // Conversion en radians pour la trigonométrie
+  float capRad = angleMoyenDeg * PI / 180.0;
+
+  // 6. Accumulation pour obtenir les coordonnées (X, Y) ultra-précises du CENTRE du robot
+  Centre_Robot_X += deltaDCentre * cos(capRad);
+  Centre_Robot_Y += deltaDCentre * sin(capRad);
+
+  // 7. Déduction géométrique de la coordonnée absolue de la pointe du STYLO
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capRad);
+}
+
+// APPLIQUE LA COMMANDE EN COURS AUX MOTEURS
+//
+// Chaque commande utilise les constantes adaptées
+// à son sens de déplacement (AV ou AR) pour que
+// la compensation de vitesse soit correcte dans
+// les deux directions.
+void appliquerCommande() {
+
+  if (commandeEnCours == "avancer") {
+    // Sens AVANT : gauche légèrement réduit (1.5% trop rapide)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "reculer") {
+    // Sens ARRIÈRE : droite légèrement réduit (6.2% trop rapide)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "vag") {
+    // VIRAGE AVANT GAUCHE : droite fort, gauche réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "vad") {
+    // VIRAGE AVANT DROITE : gauche fort, droite réduit (roue intérieure)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else if (commandeEnCours == "veg") {
+    // VIRAGE ARRIÈRE GAUCHE : droite recule fort, gauche réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_FAIBLE);
+
+  } else if (commandeEnCours == "ved") {
+    // VIRAGE ARRIÈRE DROITE : gauche recule fort, droite réduit
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_FAIBLE);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_gauche") {
+    // ROTATION GAUCHE sur place :
+    //   droite avance (PWR_DROIT_AV) / gauche recule (PWR_GAUCHE_AR)
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+    ledcWrite(canalDroit,  PWR_DROIT_AV);
+    ledcWrite(canalGauche, PWR_GAUCHE_AR);
+
+  } else if (commandeEnCours == "rotation_droite") {
+    // ROTATION DROITE sur place :
+    //   gauche avance (PWR_GAUCHE_AV) / droite recule (PWR_DROIT_AR)
+    digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  PWR_DROIT_AR);
+    ledcWrite(canalGauche, PWR_GAUCHE_AV);
+
+  } else {
+    // STOP : coupe complètement les deux moteurs
+    ledcWrite(canalDroit,  0);
+    ledcWrite(canalGauche, 0);
+  }
+
+  // LED2 allumée si un moteur tourne, éteinte si arrêt
+  digitalWrite(LEDU2, commandeEnCours != "stop" ? HIGH : LOW);
+}
+
+
+
+// Reçoit une commande depuis le navigateur
+// Met à jour commandeEnCours
+void handleCmd() {
+  if (server.hasArg("action")) {
+    String nouvelleCommande = server.arg("action");
+
+    // Reset seulement quand on change de mouvement
+    if (nouvelleCommande != commandeEnCours) {
+      noInterrupts();
+      pasDroit  = 0;
+      pasGauche = 0;
+      interrupts();
+      ecartPrecedent = 0;
     }
+
+    commandeEnCours = nouvelleCommande;
+    logf("Commande : %s\n", commandeEnCours.c_str());
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// Retourne le cap calibré en JSON 
+// Applique les offsets et scales mesurés lors de la calibration fait dans un autre code
+// -ny corrige l'inversion physique de l'axe Y du LIS3MDL
+void handleCap() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L); //on lit le registre de x
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2); //on lit le registre de y ( vu que c'est deux octets + loin on fait + 2)
+
+  // Application de la calibration hard iron + soft iron
+  float nx = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE; //on soustrait l'offset calculé dans un autre code
+  float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE; // on divise par scale, qui est la différence de si on veut tracer un cercle parfait entre x et y
+
+  // atan2 donne un angle entre -π et +π → on ramène à 0°-360°
+  float capRad = atan2(-ny, nx);
+  int cap = (int)(capRad * 180.0 / PI);
+  if (cap < 0) cap += 360;
+
+  // Mise à jour de la boussole globale lue en arrière-plan
+  capGlobal = (float)cap; 
+
+  //envoi de la réponse au web
+  server.send(200, "application/json", "{\"cap\":" + String(cap) + "}");
+}
+
+// Retourne les vitesses des deux roues en cm/s et RPM (/vitesse)
+// Les valeurs sont calculées dans calculerVitesse() dans le loop()
+// et simplement lues ici pour les renvoyer au GUI.
+void handleVitesse() {
+  char json[120];
+  snprintf(json, sizeof(json),
+    "{\"dcms\":%.1f,\"gcms\":%.1f,\"drpm\":%.1f,\"grpm\":%.1f}",
+    vitesseDcms, vitesseGcms, vitesseDrpm, vitesseGrpm);
+  server.send(200, "application/json", json);
+}
+
+// Retourne les ticks des deux encodeurs (/ticks)
+// noInterrupts/interrupts : lecture atomique pour
+// éviter une valeur à moitié mise à jour si une
+// interruption survient pendant la lecture.
+void handleTicks() {
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+  String json = "{\"droite\":" + String(d) +
+                ",\"gauche\":" + String(g) + "}";
+  server.send(200, "application/json", json);
+}
+
+// Remet les deux compteurs à zéro (/ticks/reset)
+// Appelé par le bouton "Remettre à zéro" du GUI.
+void handleTicksReset() {
+  noInterrupts();
+  pasDroit  = 0;
+  pasGauche = 0;
+  interrupts();
+  pasDroitPrev  = 0;
+  pasGauchePrev = 0;
+  pasDroitOdoPrev  = 0;
+  pasGaucheOdoPrev = 0;
+  logf("Ticks remis a zero\n");
+  server.send(200, "text/plain", "ok");
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
 
-  // Configuration des sorties moteurs
-  pinMode(EN_D, OUTPUT); pinMode(EN_G, OUTPUT);
+  // LEDs : LED1 allumée dès le démarrage
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  digitalWrite(LEDU1, HIGH);
+  digitalWrite(LEDU2, LOW);
+
+  // Moteurs : pins de direction en sortie + canaux PWM
   pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
   pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
 
-  // Configuration PWM ESP32
-  ledcSetup(canalDroit, freq, resolution);
-  ledcSetup(canalGauche, freq, resolution);
-  ledcAttachPin(EN_D, canalDroit);
-  ledcAttachPin(EN_G, canalGauche);
-
-  // Configuration Encodeurs + Interruptions
+  // Encodeurs : INPUT_PULLUP évite les fausses lectures ( active une résistance interne aux hypersensibilitées)
   pinMode(ENC_D_CH_A, INPUT_PULLUP);
   pinMode(ENC_G_CH_A, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
 
-  // WiFi et OTA (optionnel mais pratique)
+  // WiFi démarre
   WiFi.softAP(ssid, password);
-  ArduinoOTA.begin();
+
+  // Telnet : Serial Monitor sans fil
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+
+
+  // I2C + magnétomètre
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+  initLIS3MDL();
+
+  // Forcer une première lecture de la boussole pour initialiser le cap avant l'odométrie
+  handleCap();
+  capGlobalPrev = capGlobal;
+
+  tDerniereVit = millis();
+  tDerniereOdo = millis();
+
+  // Enregistrement des liens pour le bon fonctionnement du serveur Web
+  server.on("/cmd", handleCmd);
+  server.on("/cap", handleCap);
+  server.on("/vitesse", handleVitesse);
+  server.on("/ticks", handleTicks);
+  server.on("/ticks/reset", handleTicksReset);
+  server.begin();
+
+  logf("Calibration chargee :\n");
+  logf("  xOffset=%.1f  yOffset=%.1f\n", CALIB_X_OFFSET, CALIB_Y_OFFSET);
+  logf("  xScale=%.1f   yScale=%.1f\n",  CALIB_X_SCALE,  CALIB_Y_SCALE);
+  logf("GUI dispo sur : http://192.168.4.1\n");
+  logf("Telnet        : socket://192.168.4.1:23\n\n");
+
+  // LED2 clignote une fois pour signaler setup terminé
+  digitalWrite(LEDU2, HIGH);
+  delay(300);
+  digitalWrite(LEDU2, LOW);
 }
 
 void loop() {
+  server.handleClient();
   ArduinoOTA.handle();
+  checkTelnet();
+  
+  // Lecture continue de la boussole pour alimenter l'odométrie avec les angles réels les plus récents
+  handleCap(); 
 
-  if (testEnCours) {
-    dessinerCarre(0); // On commence avec un angle de 0 (face à l'axe X)
-    testEnCours = false;
-    Serial.println("Carré terminé !");
-  }
+  appliquerCommande();
+  corrigerPD();       // s'exécute toutes les 10ms
+  calculerVitesse();  // s'exécute toutes les 200ms
+  
+  // Calcule la position millimétrée (X, Y) du robot et du stylo en temps réel
+  mettreAJourOdometrie(); 
 }
