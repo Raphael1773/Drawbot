@@ -1,0 +1,1078 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>   // lib "WebSockets" de Links2004 (Library Manager)
+#include <Wire.h>
+#include <SparkFunLSM6DS3.h>
+
+// ============================================================
+// PINS
+// ============================================================
+#define LEDU1 25
+#define LEDU2 26
+#define EN_D   23
+#define EN_G    4
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// ============================================================
+// ENCODEURS
+// ============================================================
+volatile long pasDroit       = 0;
+volatile long pasGauche      = 0;
+volatile long ticksOdoDroit  = 0;
+volatile long ticksOdoGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  ticksOdoDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; ticksOdoGauche++; }
+
+// ============================================================
+// COMMANDE — enum (pas de String dans les boucles rapides)
+// ============================================================
+enum Commande {
+  CMD_STOP = 0,
+  CMD_AVANCER,
+  CMD_RECULER,
+  CMD_ROTATION_GAUCHE,
+  CMD_ROTATION_DROITE,
+  CMD_VAG,
+  CMD_VAD,
+  CMD_VEG,
+  CMD_VED,
+  CMD_VIRAGE_PROP   // contrôleur P de cap — puissance calculée en temps réel
+};
+Commande commandeEnCours = CMD_STOP;
+
+Commande stringToCommande(const String& s) {
+  if (s == "avancer")         return CMD_AVANCER;
+  if (s == "reculer")         return CMD_RECULER;
+  if (s == "rotation_gauche") return CMD_ROTATION_GAUCHE;
+  if (s == "rotation_droite") return CMD_ROTATION_DROITE;
+  if (s == "vag")             return CMD_VAG;
+  if (s == "vad")             return CMD_VAD;
+  if (s == "veg")             return CMD_VEG;
+  if (s == "ved")             return CMD_VED;
+  return CMD_STOP;
+}
+
+// ============================================================
+// IMU / MAGNÉTOMÈTRE
+// ============================================================
+#define LIS3MDL_ADDR 0x1E
+#define LSM6DS3_ADDR 0x6B
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+LSM6DS3 myIMU(I2C_MODE, LSM6DS3_ADDR);
+
+// ============================================================
+// MOTEURS
+// ============================================================
+const int   freq           = 5000;
+const int   resolution     = 8;
+const int   canalDroit     = 0;
+const int   canalGauche    = 1;
+
+const int   PWR_DROIT_AV   = 200;
+const int   PWR_GAUCHE_AV  = 208;
+const int   PWR_DROIT_AR   = 194;
+const int   PWR_GAUCHE_AR  = 200;
+const int   PWR_VIRAGE     = 150;   // 210 → 150 : moins d'inertie, meilleur arrêt
+const int   PWR_VIR_FAIBLE = 135;
+const float RATIO_VIRAGE   = (float)PWR_VIR_FAIBLE / 200.0f;
+
+// ============================================================
+// ODOMÉTRIE
+// ============================================================
+const float TICKS_PAR_TOUR = 1050.0f;
+const float DIAM_ROUE_CM   =    9.0f;
+const float CIRCONF_CM     = PI * DIAM_ROUE_CM;
+const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR;
+
+// ============================================================
+// REPÈRE CARTÉSIEN (cm)
+// ============================================================
+const float DISTANCE_MI_ENTRAXE_STYLO = 13.10f;
+
+float Centre_Robot_X    = -DISTANCE_MI_ENTRAXE_STYLO;
+float Centre_Robot_Y    =  0.0f;
+float capGlobal         =  0.0f;
+float capGlobalPrev     =  0.0f;
+float x_stylo           =  0.0f;
+float y_stylo           =  0.0f;
+float capInitialAuReset =  0.0f;
+
+// ============================================================
+// VITESSE
+// ============================================================
+const int INTERVALLE_VITESSE_MS = 200;
+float    vitesseDcms   = 0.0f;
+float    vitesseGcms   = 0.0f;
+long     pasDroitPrev  = 0, pasGauchePrev  = 0;
+uint32_t tDerniereVit  = 0;
+
+long     pasDroitOdoPrev  = 0, pasGaucheOdoPrev  = 0;
+uint32_t tDerniereOdo     = 0;
+
+// ============================================================
+// GYRO / KALMAN
+// ============================================================
+float    gyroBiasZ      = 0.0f;
+uint32_t tDernierKalman = 0;
+
+struct Kalman1D {
+  float Q_angle   = 0.001f;
+  float Q_bias    = 0.003f;
+  float R_measure = 0.03f;
+  float angle = 0.0f, bias = 0.0f;
+  float P[2][2] = {{0,0},{0,0}};
+
+  float update(float newAngle, float newRate, float dt) {
+    float rate = newRate - bias;
+    angle += dt * rate;
+    P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+    float S    = P[0][0] + R_measure;
+    float K[2] = { P[0][0]/S, P[1][0]/S };
+    float y    = newAngle - angle;
+    if (y >  180.0f) y -= 360.0f;
+    if (y < -180.0f) y += 360.0f;
+    angle += K[0]*y; bias += K[1]*y;
+    float P00 = P[0][0], P01 = P[0][1];
+    P[0][0] -= K[0]*P00; P[0][1] -= K[0]*P01;
+    P[1][0] -= K[1]*P00; P[1][1] -= K[1]*P01;
+    if (angle >= 360.0f) angle -= 360.0f;
+    if (angle <    0.0f) angle += 360.0f;
+    return angle;
+  }
+};
+Kalman1D fKalman;
+
+// ============================================================
+// WIFI / SERVEUR
+//
+// Architecture WebSocket :
+//   - WebServer  port 80  → sert uniquement la page HTML
+//   - WebSocketsServer port 81 → reçoit les commandes en temps
+//     réel et pousse les coordonnées toutes les 200 ms.
+//
+// Pourquoi ça règle les déconnexions :
+//   Avec HTTP, chaque commande ouvre puis FERME une connexion.
+//   Entre deux appuis, le réseau est silencieux → le téléphone
+//   détecte une "inactivité" et bascule sur 4G.
+//   Avec WebSocket la connexion reste OUVERTE en permanence ;
+//   l'OS ne peut plus déconnecter une interface avec un socket actif.
+// ============================================================
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+WebServer        server(80);      // page HTML
+WebSocketsServer webSocket(81);   // commandes + positions
+
+// Numéro du client WebSocket connecté (-1 = personne)
+int8_t wsClientNum = -1;
+
+// Timer pour l'envoi périodique des coordonnées
+uint32_t tDernierePosPush = 0;
+
+// ============================================================
+// MAGNÉTOMÈTRE – CALIBRATION
+// ============================================================
+const float CALIB_X_OFFSET = -2045.0f;
+const float CALIB_Y_OFFSET =   654.0f;
+const float CALIB_X_SCALE  =  1857.0f;
+const float CALIB_Y_SCALE  =  1922.0f;
+
+// ============================================================
+// PID
+// ============================================================
+uint32_t tDerniereCorr    = 0;
+const float Kp            = 0.8f;
+const float Kd            = 0.3f;
+const float Kp_rotation   = 0.3f;
+const float Kd_rotation   = 0.1f;
+long  ecartPrecedent      = 0;
+int   correctionDynamique = 0;
+
+const float Kp_traj = 1.5f;
+const float Kd_traj = 0.5f;
+bool  modeTrajectoire = false;
+float seqSegStartX    = 0.0f, seqSegStartY = 0.0f;
+float seqSegEndX      = 0.0f, seqSegEndY   = 0.0f;
+float errTransvPrev   = 0.0f;
+
+// ============================================================
+// SÉQUENCE ESCALIER
+// ============================================================
+enum EtatSequence {
+  SEQ_INACTIVE = 0,
+  SEQ_AVANCE_1,
+  SEQ_PAUSE_1,
+  SEQ_PRE_VIRAGE_G,
+  SEQ_PAUSE_PRE_G,
+  SEQ_TOURNE_G,
+  SEQ_PAUSE_POST_G,
+  SEQ_POST_VIRAGE_G,
+  SEQ_PAUSE_2,
+  SEQ_AVANCE_2,
+  SEQ_PAUSE_3,
+  SEQ_PRE_VIRAGE_D,
+  SEQ_PAUSE_PRE_D,
+  SEQ_TOURNE_D,
+  SEQ_PAUSE_POST_D,
+  SEQ_POST_VIRAGE_D,
+  SEQ_PAUSE_4,
+  SEQ_AVANCE_3,
+  SEQ_TERMINEE
+};
+
+EtatSequence etatSequence  = SEQ_INACTIVE;
+bool         sequenceActive = false;
+
+float    seqCapPrecedent  = 0.0f;
+float    seqAngleParcouru = 0.0f;
+uint32_t tPauseSeq        = 0;
+long     ticksCible       = 0;
+
+const uint32_t PAUSE_SEQ_MS        = 400;
+const uint32_t PAUSE_POST_ROT_MS   = 600;   // laisse le magnéto se stabiliser
+const uint32_t TIMEOUT_SEGMENT_MS  = 10000;
+uint32_t tDebutSegment = 0;
+
+// ============================================================
+// CONTRÔLEUR PROPORTIONNEL DE CAP (virage séquence)
+//
+// Principe : toutes les 10 ms, on mesure l'écart entre le cap
+// cible et capGlobal. La puissance moteur est proportionnelle
+// à cet écart, bornée entre PWR_VIRAGE_MIN et PWR_VIRAGE_MAX.
+// En dessous de SEUIL_ARRIVE (2°) on considère le virage fini.
+//
+// virageProportionnel_pwr > 0 → rotation gauche
+// virageProportionnel_pwr < 0 → rotation droite
+// ============================================================
+// ============================================================
+// CONTRÔLEUR DE VIRAGE PAR MICRO-PAS
+//
+// Au lieu de tourner en continu (grand arc), on procède par
+// petits pas discrets :
+//   1. Tourner jusqu'à ce que le cap ait changé de PAS_VIRAGE_DEG (3°)
+//   2. Stop + pause PAUSE_PAS_VIRAGE_MS (100 ms) — magnéto se stabilise
+//   3. Vérifier erreur globale :
+//        < SEUIL_ARRIVE (2°) → virage terminé
+//        sinon              → pas suivant
+//
+// Arc par pas = 3° × 13,1 cm × π/180 ≈ 0,7 cm  (quasi invisible)
+// Durée totale 90° ≈ 30 pas × 120 ms ≈ 3,6 s
+// ============================================================
+float    targetCapVirage          =   0.0f;
+int      virageProportionnel_pwr  =   0;
+
+// Sous-état du virage
+enum VirageSousEtat { VIR_TOURNE, VIR_STABILISE };
+VirageSousEtat virageSousEtat = VIR_TOURNE;
+float    capDebutPas   = 0.0f;  // cap au début du pas en cours
+uint32_t tPasVirage    = 0;     // horodatage début de la pause
+
+const float    PAS_VIRAGE_DEG      =  3.0f;   // degrés par micro-pas
+const uint32_t PAUSE_PAS_VIRAGE_MS =  100;    // pause stabilisation (ms)
+const float    Kp_virage_prop      =  2.5f;   // gain °→PWM pendant le pas
+const int      PWR_VIRAGE_MIN      =   80;    // puissance minimale
+const int      PWR_VIRAGE_MAX      =  180;    // puissance maximale
+const float    SEUIL_ARRIVE        =   2.0f;  // tolérance finale (°)
+const float    SEQ_DIST_1   = 20.0f;
+const float    SEQ_DIST_2   = 10.0f;
+const float    SEQ_DIST_3   = 40.0f;
+const float    SEQ_ANGLE    = 90.0f;
+
+// ============================================================
+// FONCTIONS BAS NIVEAU
+// ============================================================
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); Wire.write(reg | 0x80); Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  return (int16_t)(Wire.read() | (Wire.read() << 8));
+}
+
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x7E);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+}
+
+void calibrerGyro() {
+  long somme = 0;
+  for (int i = 0; i < 300; i++) { somme += myIMU.readRawGyroZ(); delay(4); }
+  gyroBiasZ = (float)somme / 300.0f;
+}
+
+float obtenirCapMagnetometre() {
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_X_L + 2);
+  float nx   = (mx - CALIB_X_OFFSET) / CALIB_X_SCALE;
+  float ny   = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
+  float cap  = atan2(-ny, nx) * 180.0f / PI;
+  if (cap < 0) cap += 360.0f;
+  return cap;
+}
+
+void executerFiltreKalman() {
+  uint32_t maintenant = millis();
+  float dt = (maintenant - tDernierKalman) / 1000.0f;
+  if (dt < 0.020f) return;
+  tDernierKalman = maintenant;
+  float gyroCorrige       = myIMU.readRawGyroZ() - gyroBiasZ;
+  float vitesseAngulaireZ = gyroCorrige * 4.375f / 1000.0f;
+  capGlobal = fKalman.update(obtenirCapMagnetometre(), vitesseAngulaireZ, dt);
+}
+
+void reinitialiserRepereCartesien() {
+  noInterrupts();
+  pasDroit  = 0; pasGauche  = 0;
+  ticksOdoDroit = 0; ticksOdoGauche = 0;
+  interrupts();
+  pasDroitPrev  = 0; pasGauchePrev  = 0;
+  pasDroitOdoPrev = 0; pasGaucheOdoPrev = 0;
+  capInitialAuReset = capGlobal;
+  Centre_Robot_X    = -DISTANCE_MI_ENTRAXE_STYLO;
+  Centre_Robot_Y    =  0.0f;
+  x_stylo           =  0.0f;
+  y_stylo           =  0.0f;
+  capGlobalPrev     = capGlobal;
+}
+
+void calculerVitesse() {
+  if (millis() - tDerniereVit < INTERVALLE_VITESSE_MS) return;
+  float dt = (millis() - tDerniereVit) / 1000.0f;
+  tDerniereVit = millis();
+  noInterrupts(); long d = pasDroit; long g = pasGauche; interrupts();
+  vitesseDcms = ((d - pasDroitPrev)  / dt) * CM_PAR_TICK;
+  vitesseGcms = ((g - pasGauchePrev) / dt) * CM_PAR_TICK;
+  pasDroitPrev = d; pasGauchePrev = g;
+}
+
+void mettreAJourOdometrie() {
+  if (millis() - tDerniereOdo < 10) return;
+  tDerniereOdo = millis();
+
+  noInterrupts();
+  long actuelsD = ticksOdoDroit;
+  long actuelsG = ticksOdoGauche;
+  interrupts();
+
+  long deltaTicksD = actuelsD - pasDroitOdoPrev;
+  long deltaTicksG = actuelsG - pasGaucheOdoPrev;
+  pasDroitOdoPrev  = actuelsD;
+  pasGaucheOdoPrev = actuelsG;
+
+  float distD = (float)deltaTicksD * CM_PAR_TICK;
+  float distG = (float)deltaTicksG * CM_PAR_TICK;
+  float deltaDCentre = 0.0f;
+
+  if      (commandeEnCours == CMD_AVANCER || commandeEnCours == CMD_VAG || commandeEnCours == CMD_VAD)
+    deltaDCentre =  (distD + distG) / 2.0f;
+  else if (commandeEnCours == CMD_RECULER || commandeEnCours == CMD_VEG || commandeEnCours == CMD_VED)
+    deltaDCentre = -(distD + distG) / 2.0f;
+
+  float diffCap = capGlobal - capGlobalPrev;
+  if (diffCap >  180.0f) diffCap -= 360.0f;
+  if (diffCap < -180.0f) diffCap += 360.0f;
+  float angleMoyenDeg = capGlobalPrev + diffCap / 2.0f;
+  capGlobalPrev = capGlobal;
+
+  float capVirtuelDeg = angleMoyenDeg - capInitialAuReset;
+  float capRad        = capVirtuelDeg * PI / 180.0f;
+
+  Centre_Robot_X += deltaDCentre * cosf(capRad);
+  Centre_Robot_Y += deltaDCentre * sinf(capRad);
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cosf(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sinf(capRad);
+}
+
+// ============================================================
+// PUSH COORDONNÉES via WebSocket
+// Appelé toutes les 200 ms depuis loop().
+// Remplace le polling HTTP GET /pos toutes les 300 ms.
+// ============================================================
+void envoyerPositions() {
+  if (millis() - tDernierePosPush < 200) return;
+  tDernierePosPush = millis();
+  if (wsClientNum < 0) return;   // personne de connecté
+  char json[128];
+  snprintf(json, sizeof(json),
+    "{\"t\":\"pos\",\"rx\":%.1f,\"ry\":%.1f,\"sx\":%.1f,\"sy\":%.1f}",
+    Centre_Robot_X * 10.0f, Centre_Robot_Y * 10.0f,
+    x_stylo        * 10.0f, y_stylo        * 10.0f);
+  webSocket.sendTXT((uint8_t)wsClientNum, json);
+}
+
+// ============================================================
+// GÉOMÉTRIE TRAJECTOIRE
+// ============================================================
+float crossTrackError() {
+  float dx  = seqSegEndX - seqSegStartX;
+  float dy  = seqSegEndY - seqSegStartY;
+  float len = sqrtf(dx*dx + dy*dy);
+  if (len < 0.001f) return 0.0f;
+  float nx = -dy / len;
+  float ny =  dx / len;
+  return (x_stylo - seqSegStartX)*nx + (y_stylo - seqSegStartY)*ny;
+}
+
+float alongTrackProgress() {
+  float dx  = seqSegEndX - seqSegStartX;
+  float dy  = seqSegEndY - seqSegStartY;
+  float len = sqrtf(dx*dx + dy*dy);
+  if (len < 0.001f) return 0.0f;
+  return ((x_stylo - seqSegStartX)*dx + (y_stylo - seqSegStartY)*dy) / len;
+}
+
+float longueurSegment() {
+  float dx = seqSegEndX - seqSegStartX;
+  float dy = seqSegEndY - seqSegStartY;
+  return sqrtf(dx*dx + dy*dy);
+}
+
+// ============================================================
+// HELPERS DÉMARRAGE DE PHASES
+// ============================================================
+void demarrerSegment(float dirX, float dirY, float longueur) {
+  noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+  ecartPrecedent = 0; correctionDynamique = 0; errTransvPrev = 0.0f;
+  seqSegStartX = x_stylo; seqSegStartY = y_stylo;
+  seqSegEndX   = x_stylo + dirX * longueur;
+  seqSegEndY   = y_stylo + dirY * longueur;
+  modeTrajectoire = true;
+  commandeEnCours = CMD_AVANCER;
+  tDebutSegment   = millis();   // horodatage pour le timeout
+}
+
+// deltaDeg : +90 = virage gauche, -90 = virage droite
+void demarrerTourner(float deltaDeg) {
+  targetCapVirage = capGlobal + deltaDeg;
+  if (targetCapVirage >= 360.0f) targetCapVirage -= 360.0f;
+  if (targetCapVirage <    0.0f) targetCapVirage += 360.0f;
+  noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+  ecartPrecedent           = 0;
+  correctionDynamique      = 0;
+  virageProportionnel_pwr  = 0;
+  capDebutPas              = capGlobal;
+  virageSousEtat           = VIR_TOURNE;
+  modeTrajectoire          = false;
+  commandeEnCours          = CMD_VIRAGE_PROP;
+}
+
+void demarrerMouvementCourt(float distCm, Commande direction) {
+  noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+  ecartPrecedent = 0; correctionDynamique = 0;
+  modeTrajectoire = false;
+  ticksCible      = (long)(distCm / CM_PAR_TICK);
+  commandeEnCours = direction;
+}
+
+void capVersVecteur(float &dirX, float &dirY) {
+  float rad = (capGlobal - capInitialAuReset) * PI / 180.0f;
+  dirX = cosf(rad);
+  dirY = sinf(rad);
+}
+
+// ============================================================
+// PID
+// ============================================================
+void corrigerPD() {
+  if (commandeEnCours == CMD_STOP) { correctionDynamique = 0; return; }
+  if (millis() - tDerniereCorr < 10) return;
+  tDerniereCorr = millis();
+
+  if (modeTrajectoire && commandeEnCours == CMD_AVANCER) {
+    float err = crossTrackError();
+    correctionDynamique = (int)(Kp_traj * err + Kd_traj * (err - errTransvPrev));
+    correctionDynamique = constrain(correctionDynamique, -60, 60);
+    errTransvPrev = err;
+    return;
+  }
+
+  noInterrupts(); long tD = pasDroit; long tG = pasGauche; interrupts();
+  long  ecart     = 0;
+  float kp_actuel = Kp;
+  float kd_actuel = Kd;
+
+  switch (commandeEnCours) {
+    case CMD_AVANCER:
+    case CMD_RECULER:   ecart = tD - tG; break;
+    case CMD_ROTATION_GAUCHE:
+    case CMD_ROTATION_DROITE:
+      ecart = tD - tG; kp_actuel = Kp_rotation; kd_actuel = Kd_rotation; break;
+    case CMD_VAG: ecart = tG - (long)(tD * RATIO_VIRAGE); break;
+    case CMD_VAD: ecart = tD - (long)(tG * RATIO_VIRAGE); break;
+    case CMD_VEG: ecart = tG - (long)(tD * RATIO_VIRAGE); break;
+    case CMD_VED: ecart = tD - (long)(tG * RATIO_VIRAGE); break;
+    default: break;
+  }
+
+  correctionDynamique = (int)((ecart * kp_actuel) + ((ecart - ecartPrecedent) * kd_actuel));
+  ecartPrecedent = ecart;
+}
+
+// ============================================================
+// SÉQUENCE ESCALIER
+// ============================================================
+void gererSequence() {
+  if (!sequenceActive) return;
+
+  switch (etatSequence) {
+    case SEQ_AVANCE_1:
+      if (alongTrackProgress() >= longueurSegment() ||
+          millis() - tDebutSegment > TIMEOUT_SEGMENT_MS) {
+        modeTrajectoire = false; commandeEnCours = CMD_STOP;
+        tPauseSeq = millis(); etatSequence = SEQ_PAUSE_1;
+      }
+      break;
+    case SEQ_PAUSE_1:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        demarrerMouvementCourt(DISTANCE_MI_ENTRAXE_STYLO, CMD_AVANCER);
+        etatSequence = SEQ_PRE_VIRAGE_G;
+      }
+      break;
+    case SEQ_PRE_VIRAGE_G: {
+      noInterrupts(); long d = pasDroit; interrupts();
+      if (d >= ticksCible) {
+        commandeEnCours = CMD_STOP; tPauseSeq = millis();
+        etatSequence = SEQ_PAUSE_PRE_G;
+      }
+      break;
+    }
+    case SEQ_PAUSE_PRE_G:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        demarrerTourner(+90.0f);   // +90° = virage gauche
+        etatSequence = SEQ_TOURNE_G;
+      }
+      break;
+    // ── Virage gauche par micro-pas ────────────────────────────────────
+    case SEQ_TOURNE_G: {
+      // Erreur globale (target - actuel), normalisée ±180°
+      float errGlobale = targetCapVirage - capGlobal;
+      if (errGlobale >  180.0f) errGlobale -= 360.0f;
+      if (errGlobale < -180.0f) errGlobale += 360.0f;
+
+      if (virageSousEtat == VIR_TOURNE) {
+        // Mesurer combien on a tourné depuis le début de ce pas
+        float deltaPas = capGlobal - capDebutPas;
+        if (deltaPas >  180.0f) deltaPas -= 360.0f;
+        if (deltaPas < -180.0f) deltaPas += 360.0f;
+
+        bool pasFini = fabsf(deltaPas) >= PAS_VIRAGE_DEG
+                    || fabsf(errGlobale) < SEUIL_ARRIVE;
+
+        if (pasFini) {
+          // Stop et attente de stabilisation du magnéto
+          virageProportionnel_pwr = 0;
+          commandeEnCours = CMD_STOP;
+          virageSousEtat  = VIR_STABILISE;
+          tPasVirage      = millis();
+        } else {
+          // Puissance proportionnelle à l'erreur globale restante
+          int pwr = constrain((int)(fabsf(errGlobale) * Kp_virage_prop),
+                              PWR_VIRAGE_MIN, PWR_VIRAGE_MAX);
+          virageProportionnel_pwr = (errGlobale > 0.0f) ? pwr : -pwr;
+          commandeEnCours = CMD_VIRAGE_PROP;
+        }
+      } else {  // VIR_STABILISE — attente 100 ms
+        if (millis() - tPasVirage >= PAUSE_PAS_VIRAGE_MS) {
+          // Re-lire l'erreur après stabilisation
+          float err = targetCapVirage - capGlobal;
+          if (err >  180.0f) err -= 360.0f;
+          if (err < -180.0f) err += 360.0f;
+          if (fabsf(err) < SEUIL_ARRIVE) {
+            // Virage terminé avec précision
+            commandeEnCours = CMD_STOP;
+            tPauseSeq = millis();
+            etatSequence = SEQ_PAUSE_POST_G;
+          } else {
+            // Nouveau micro-pas
+            capDebutPas    = capGlobal;
+            virageSousEtat = VIR_TOURNE;
+          }
+        }
+      }
+      break;
+    }
+    case SEQ_PAUSE_POST_G:
+      if (millis() - tPauseSeq >= PAUSE_POST_ROT_MS) {  // pause longue : magnéto se stabilise
+        demarrerMouvementCourt(DISTANCE_MI_ENTRAXE_STYLO, CMD_RECULER);
+        etatSequence = SEQ_POST_VIRAGE_G;
+      }
+      break;
+    case SEQ_POST_VIRAGE_G: {
+      noInterrupts(); long d = pasDroit; interrupts();
+      if (d >= ticksCible) {
+        commandeEnCours = CMD_STOP; tPauseSeq = millis();
+        etatSequence = SEQ_PAUSE_2;
+      }
+      break;
+    }
+    case SEQ_PAUSE_2:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        float dx, dy; capVersVecteur(dx, dy);
+        demarrerSegment(dx, dy, SEQ_DIST_2); etatSequence = SEQ_AVANCE_2;
+      }
+      break;
+    case SEQ_AVANCE_2:
+      if (alongTrackProgress() >= longueurSegment() ||
+          millis() - tDebutSegment > TIMEOUT_SEGMENT_MS) {
+        modeTrajectoire = false; commandeEnCours = CMD_STOP;
+        tPauseSeq = millis(); etatSequence = SEQ_PAUSE_3;
+      }
+      break;
+    case SEQ_PAUSE_3:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        demarrerMouvementCourt(DISTANCE_MI_ENTRAXE_STYLO, CMD_AVANCER);
+        etatSequence = SEQ_PRE_VIRAGE_D;
+      }
+      break;
+    case SEQ_PRE_VIRAGE_D: {
+      noInterrupts(); long d = pasDroit; interrupts();
+      if (d >= ticksCible) {
+        commandeEnCours = CMD_STOP; tPauseSeq = millis();
+        etatSequence = SEQ_PAUSE_PRE_D;
+      }
+      break;
+    }
+    case SEQ_PAUSE_PRE_D:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        demarrerTourner(-90.0f);   // -90° = virage droite
+        etatSequence = SEQ_TOURNE_D;
+      }
+      break;
+    // ── Virage droite par micro-pas ────────────────────────────────────
+    case SEQ_TOURNE_D: {
+      float errGlobale = targetCapVirage - capGlobal;
+      if (errGlobale >  180.0f) errGlobale -= 360.0f;
+      if (errGlobale < -180.0f) errGlobale += 360.0f;
+
+      if (virageSousEtat == VIR_TOURNE) {
+        float deltaPas = capGlobal - capDebutPas;
+        if (deltaPas >  180.0f) deltaPas -= 360.0f;
+        if (deltaPas < -180.0f) deltaPas += 360.0f;
+
+        bool pasFini = fabsf(deltaPas) >= PAS_VIRAGE_DEG
+                    || fabsf(errGlobale) < SEUIL_ARRIVE;
+
+        if (pasFini) {
+          virageProportionnel_pwr = 0;
+          commandeEnCours = CMD_STOP;
+          virageSousEtat  = VIR_STABILISE;
+          tPasVirage      = millis();
+        } else {
+          int pwr = constrain((int)(fabsf(errGlobale) * Kp_virage_prop),
+                              PWR_VIRAGE_MIN, PWR_VIRAGE_MAX);
+          virageProportionnel_pwr = (errGlobale > 0.0f) ? pwr : -pwr;
+          commandeEnCours = CMD_VIRAGE_PROP;
+        }
+      } else {  // VIR_STABILISE
+        if (millis() - tPasVirage >= PAUSE_PAS_VIRAGE_MS) {
+          float err = targetCapVirage - capGlobal;
+          if (err >  180.0f) err -= 360.0f;
+          if (err < -180.0f) err += 360.0f;
+          if (fabsf(err) < SEUIL_ARRIVE) {
+            commandeEnCours = CMD_STOP;
+            tPauseSeq = millis();
+            etatSequence = SEQ_PAUSE_POST_D;
+          } else {
+            capDebutPas    = capGlobal;
+            virageSousEtat = VIR_TOURNE;
+          }
+        }
+      }
+      break;
+    }
+    case SEQ_PAUSE_POST_D:
+      if (millis() - tPauseSeq >= PAUSE_POST_ROT_MS) {  // pause longue : magnéto se stabilise
+        demarrerMouvementCourt(DISTANCE_MI_ENTRAXE_STYLO, CMD_RECULER);
+        etatSequence = SEQ_POST_VIRAGE_D;
+      }
+      break;
+    case SEQ_POST_VIRAGE_D: {
+      noInterrupts(); long d = pasDroit; interrupts();
+      if (d >= ticksCible) {
+        commandeEnCours = CMD_STOP; tPauseSeq = millis();
+        etatSequence = SEQ_PAUSE_4;
+      }
+      break;
+    }
+    case SEQ_PAUSE_4:
+      if (millis() - tPauseSeq >= PAUSE_SEQ_MS) {
+        float dx, dy; capVersVecteur(dx, dy);
+        demarrerSegment(dx, dy, SEQ_DIST_3); etatSequence = SEQ_AVANCE_3;
+      }
+      break;
+    case SEQ_AVANCE_3:
+      if (alongTrackProgress() >= longueurSegment() ||
+          millis() - tDebutSegment > TIMEOUT_SEGMENT_MS) {
+        modeTrajectoire = false; commandeEnCours = CMD_STOP;
+        etatSequence = SEQ_TERMINEE; sequenceActive = false;
+        if (wsClientNum >= 0)
+          webSocket.sendTXT((uint8_t)wsClientNum, "{\"t\":\"seq_done\"}");
+      }
+      break;
+    default: break;
+  }
+}
+
+// ============================================================
+// WEBSOCKET — réception des commandes
+// ============================================================
+void onWebSocketEvent(uint8_t num, WStype_t type,
+                      uint8_t* payload, size_t length) {
+  switch (type) {
+
+    case WStype_CONNECTED:
+      wsClientNum = (int8_t)num;
+      break;
+
+    case WStype_DISCONNECTED:
+      if ((int8_t)num == wsClientNum) wsClientNum = -1;
+      // Sécurité : stopper le robot si le client se déconnecte
+      if (!sequenceActive) {
+        commandeEnCours = CMD_STOP;
+        modeTrajectoire = false;
+      }
+      break;
+
+    case WStype_TEXT: {
+      String msg = String((char*)payload);
+
+      if (msg == "reset_cart") {
+        reinitialiserRepereCartesien();
+        break;
+      }
+      if (msg == "seq_start") {
+        reinitialiserRepereCartesien();
+        errTransvPrev  = 0.0f;
+        sequenceActive = true;
+        demarrerSegment(1.0f, 0.0f, SEQ_DIST_1);
+        etatSequence = SEQ_AVANCE_1;
+        break;
+      }
+
+      Commande nouvelleCommande = stringToCommande(msg);
+      if (sequenceActive) {
+        if (nouvelleCommande == CMD_STOP) {
+          etatSequence = SEQ_INACTIVE; sequenceActive = false;
+          modeTrajectoire = false; commandeEnCours = CMD_STOP;
+        }
+        // autre commande ignorée pendant la séquence
+      } else {
+        if (nouvelleCommande != commandeEnCours) {
+          noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+          ecartPrecedent = 0; correctionDynamique = 0;
+          modeTrajectoire = false;
+        }
+        commandeEnCours = nouvelleCommande;
+      }
+      break;
+    }
+
+    default: break;
+  }
+}
+
+// ============================================================
+// APPLICATION DES COMMANDES MOTEUR
+// ============================================================
+void appliquerCommande() {
+  switch (commandeEnCours) {
+    case CMD_AVANCER:
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit,  constrain(PWR_DROIT_AV  - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, constrain(PWR_GAUCHE_AV + correctionDynamique, 0, 255));
+      break;
+    case CMD_RECULER:
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit,  constrain(PWR_DROIT_AR  - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, constrain(PWR_GAUCHE_AR + correctionDynamique, 0, 255));
+      break;
+    case CMD_ROTATION_GAUCHE:
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit,  constrain(PWR_VIRAGE - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, constrain(PWR_VIRAGE + correctionDynamique, 0, 255));
+      break;
+    case CMD_ROTATION_DROITE:
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit,  constrain(PWR_VIRAGE - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, constrain(PWR_VIRAGE + correctionDynamique, 0, 255));
+      break;
+    case CMD_VAG:
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit,  PWR_DROIT_AV);
+      ledcWrite(canalGauche, constrain(PWR_VIR_FAIBLE - correctionDynamique, 0, 255));
+      break;
+    case CMD_VAD:
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit,  constrain(PWR_VIR_FAIBLE - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, PWR_GAUCHE_AV);
+      break;
+    case CMD_VEG:
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit,  PWR_DROIT_AR);
+      ledcWrite(canalGauche, constrain(PWR_VIR_FAIBLE - correctionDynamique, 0, 255));
+      break;
+    case CMD_VED:
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit,  constrain(PWR_VIR_FAIBLE - correctionDynamique, 0, 255));
+      ledcWrite(canalGauche, PWR_GAUCHE_AR);
+      break;
+    case CMD_VIRAGE_PROP:
+      // Puissance et sens calculés par le contrôleur P toutes les 10 ms
+      if (virageProportionnel_pwr > 0) {
+        // Rotation gauche : D en avant, G en arrière
+        digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+        digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+        ledcWrite(canalDroit,  virageProportionnel_pwr);
+        ledcWrite(canalGauche, virageProportionnel_pwr);
+      } else if (virageProportionnel_pwr < 0) {
+        // Rotation droite : D en arrière, G en avant
+        digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+        digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+        ledcWrite(canalDroit,  -virageProportionnel_pwr);
+        ledcWrite(canalGauche, -virageProportionnel_pwr);
+      } else {
+        ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+      }
+      break;
+    default:
+      ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+      break;
+  }
+  digitalWrite(LEDU2, commandeEnCours != CMD_STOP ? HIGH : LOW);
+}
+
+// ============================================================
+// PAGE HTML — embarquée dans le firmware
+// L'URL du WebSocket est construite dynamiquement depuis
+// window.location.hostname pour fonctionner quelle que soit
+// l'IP de l'ESP32.
+// ============================================================
+const char PAGE_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Draw_GOAAAT</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: #111; color: #fff; font-family: sans-serif; display: flex;
+           flex-direction: column; align-items: center; min-height: 100vh; gap: 16px; padding: 20px; }
+    h1 { font-size: 1.4rem; letter-spacing: 2px; color: #0af; }
+    #ws-status { font-size: 0.75rem; color: #f80; }
+    #ws-status.ok { color: #0f8; }
+    .grid { display: grid; grid-template-columns: repeat(3, 90px);
+            grid-template-rows: repeat(3, 90px); gap: 10px;
+            touch-action: none; user-select: none; }
+    .btn { background: #222; border: 2px solid #444; border-radius: 14px; color: #fff;
+           font-size: 2rem; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+    .btn:active, .btn.pressed { background: #0af; border-color: #0af; color: #000; transform: scale(0.93); }
+    .btn.danger:active, .btn.danger.pressed { background: #f44; border-color: #f44; }
+    .action-btn { border-radius: 12px; color: #fff; font-size: 1rem; font-weight: bold;
+                  padding: 12px; width: 290px; cursor: pointer; text-align: center;
+                  text-transform: uppercase; border-width: 2px; border-style: solid; }
+    #btn-cart-reset { background: #058; border-color: #08f; }
+    #btn-cart-reset:active { background: #0af; transform: scale(0.97); }
+    #btn-seq { background: #050; border-color: #0c0; }
+    #btn-seq:active  { background: #0f0; color: #000; transform: scale(0.97); }
+    #btn-seq:disabled { background: #222; border-color: #444; color: #555; cursor: not-allowed; }
+    .data-box { background: #1a1a1a; border: 1px solid #333; border-radius: 16px;
+                padding: 14px 24px; display: flex; flex-direction: column; gap: 10px; width: 290px; }
+    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+    .data-label { font-size: 0.78rem; color: #888; align-self: center; }
+    .data-val   { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
+    .data-val.robot { color: #0f8; }
+    .data-val.stylo { color: #f0f; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Draw_GOAAAT</h1>
+  <span id="ws-status">⬤ Connexion…</span>
+
+  <div class="grid">
+    <div class="btn" data-cmd="vag">↖</div>
+    <div class="btn" data-cmd="avancer">⬆</div>
+    <div class="btn" data-cmd="vad">↗</div>
+    <div class="btn" data-cmd="rotation_gauche">↺</div>
+    <div class="btn danger" data-cmd="stop">■</div>
+    <div class="btn" data-cmd="rotation_droite">↻</div>
+    <div class="btn" data-cmd="veg">↙</div>
+    <div class="btn" data-cmd="reculer">⬇</div>
+    <div class="btn" data-cmd="ved">↘</div>
+  </div>
+
+  <button class="action-btn" id="btn-cart-reset">🎯 Reset Repère Cartésien</button>
+  <button class="action-btn" id="btn-seq">🪜 Séquence Escalier</button>
+
+  <div class="data-box">
+    <h2 style="color:#f0f; font-size:0.9rem;">📍 COORDONNÉES (mm)</h2>
+    <div class="data-grid">
+      <span class="data-label">Robot X</span> <span class="data-val robot" id="rob-x">—</span>
+      <span class="data-label">Robot Y</span> <span class="data-val robot" id="rob-y">—</span>
+      <span class="data-label">Stylo X</span> <span class="data-val stylo" id="sty-x">—</span>
+      <span class="data-label">Stylo Y</span> <span class="data-val stylo" id="sty-y">—</span>
+    </div>
+  </div>
+
+  <script>
+    // ── WebSocket ────────────────────────────────────────────
+    const wsUrl = 'ws://' + location.hostname + ':81/';
+    let ws;
+    const statusEl = document.getElementById('ws-status');
+
+    function connect() {
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        statusEl.textContent = '⬤ Connecté';
+        statusEl.className = 'ok';
+      };
+      ws.onclose = () => {
+        statusEl.textContent = '⬤ Déconnecté — reconnexion…';
+        statusEl.className = '';
+        setTimeout(connect, 1000);   // reconnexion automatique
+      };
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.t === 'pos') {
+          document.getElementById('rob-x').textContent = d.rx.toFixed(1);
+          document.getElementById('rob-y').textContent = d.ry.toFixed(1);
+          document.getElementById('sty-x').textContent = d.sx.toFixed(1);
+          document.getElementById('sty-y').textContent = d.sy.toFixed(1);
+        }
+        if (d.t === 'seq_done') {
+          btnSeq.textContent = '🪜 Séquence Escalier';
+          btnSeq.disabled = false;
+        }
+      };
+    }
+    connect();
+
+    function send(cmd) {
+      if (ws && ws.readyState === 1) ws.send(cmd);
+    }
+
+    // ── Boutons directionnels ────────────────────────────────
+    document.querySelectorAll('.grid .btn').forEach(btn => {
+      const cmd = btn.dataset.cmd;
+      btn.addEventListener('touchstart', e => {
+        e.preventDefault(); btn.classList.add('pressed'); send(cmd);
+      }, { passive: false });
+      btn.addEventListener('touchend', e => {
+        e.preventDefault(); btn.classList.remove('pressed'); send('stop');
+      });
+      btn.addEventListener('mousedown', e => {
+        e.preventDefault(); btn.classList.add('pressed'); send(cmd);
+      });
+      btn.addEventListener('mouseup', () => {
+        btn.classList.remove('pressed'); send('stop');
+      });
+    });
+
+    // ── Reset repère ─────────────────────────────────────────
+    document.getElementById('btn-cart-reset')
+      .addEventListener('click', () => send('reset_cart'));
+
+    // ── Séquence escalier ────────────────────────────────────
+    const btnSeq = document.getElementById('btn-seq');
+    btnSeq.addEventListener('click', () => {
+      btnSeq.textContent = '⏳ En cours…';
+      btnSeq.disabled = true;
+      send('seq_start');
+      // Fallback si l'ESP32 ne répond pas (timeout 35 s)
+      setTimeout(() => {
+        btnSeq.textContent = '🪜 Séquence Escalier';
+        btnSeq.disabled = false;
+      }, 35000);
+    });
+  </script>
+</body>
+</html>
+)rawhtml";
+
+void handleRoot() { server.send_P(200, "text/html", PAGE_HTML); }
+
+// ============================================================
+// SETUP & LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT); digitalWrite(LEDU1, HIGH);
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_D_CH_A, INPUT_PULLUP); pinMode(ENC_D_CH_B, INPUT_PULLUP);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP); pinMode(ENC_G_CH_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  WiFi.softAP(ssid, password);
+
+  // WebServer port 80 : page HTML uniquement
+  server.on("/", handleRoot);
+  server.begin();
+
+  // WebSocket port 81 : commandes + positions
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+
+  Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(400000);
+  initLIS3MDL();
+  if (myIMU.begin() == 0) { calibrerGyro(); }
+
+  capGlobal = obtenirCapMagnetometre();
+  reinitialiserRepereCartesien();
+  tDernierKalman    = millis();
+  tDerniereVit      = millis();
+  tDerniereOdo      = millis();
+  tDernierePosPush  = millis();
+}
+
+void loop() {
+  webSocket.loop();        // traite les événements WebSocket
+  server.handleClient();   // sert la page HTML si besoin
+  executerFiltreKalman();
+  gererSequence();
+  appliquerCommande();
+  corrigerPD();
+  calculerVitesse();
+  mettreAJourOdometrie();
+  envoyerPositions();      // push coords toutes les 200 ms
+  delay(1);
+}
