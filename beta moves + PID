@@ -66,8 +66,8 @@ const float CIRCONF_CM     = PI * DIAM_ROUE_CM;
 const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR; 
 
 // CONFIGURATION DU REPERE CARTESIEN
-const float DISTANCE_MI_ENTRAXE_STYLO = 13.10;
-float Centre_Robot_X = -13.10; 
+const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;
+float Centre_Robot_X = -12.70; 
 float Centre_Robot_Y = 0.0;
 float capGlobal = 0.0; 
 float capGlobalPrev = 0.0; 
