@@ -1,0 +1,462 @@
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <SparkFunLSM6DS3.h>
+
+// --- CONFIGURATION MATÉRIELLE ---
+#define LEDU1 25
+#define LEDU2 26
+#define EN_D 23
+#define EN_G  4
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+#define ENC_G_CH_A 32
+#define ENC_G_CH_B 33
+#define ENC_D_CH_A 27
+#define ENC_D_CH_B 14
+
+// --- VARIABLES ODOMÉTRIE ---
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+volatile long ticksOdoDroit  = 0;
+volatile long ticksOdoGauche = 0;
+
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  ticksOdoDroit++; }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; ticksOdoGauche++; }
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define LIS3MDL_ADDR 0x1E
+#define LSM6DS3_ADDR 0x6B
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+#define LIS3_OUT_X_L 0x28
+
+LSM6DS3 myIMU(I2C_MODE, LSM6DS3_ADDR);
+
+const int freq        = 5000;
+const int resolution  = 8;
+const int canalDroit  = 0;
+const int canalGauche = 1;
+
+// --- PARAMÈTRES DE PUISSANCE ---
+const int PWR_DROIT_AV  = 200;
+const int PWR_GAUCHE_AV = 208;
+const int PWR_DROIT_AR  = 194;
+const int PWR_GAUCHE_AR = 200;
+const int PWR_VIRAGE    = 210;
+const int PWR_ROT_SERRE = 120;
+
+const float TICKS_PAR_TOUR = 1050.0;
+const float DIAM_ROUE_CM   = 9.0;
+const float CIRCONF_CM     = PI * DIAM_ROUE_CM;
+const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR;
+
+// --- CONFIGURATION REPÈRE CARTÉSIEN ---
+const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;
+float Centre_Robot_X = -12.70;
+float Centre_Robot_Y = 0.0;
+float capGlobal = 0.0;
+float capGlobalPrev = 0.0;
+float x_stylo = 0.0;
+float y_stylo = 0.0;
+float capInitialAuReset = 0.0;
+
+// --- PARAMÈTRES ASSERVISSEMENT ---
+const float K_P_CAP    = 3.5;
+const float K_CTE      = 2.0;
+const float ZONE_VIRAGE_CM = 1.5;
+
+// --- FILTRE DE KALMAN ET CAPTEURS ---
+float gyroBiasZ   = 0.0;
+uint32_t tDernierKalman = 0;
+uint32_t tDerniereOdo   = 0;
+
+// *** CORRECTION 1 : P déclaré en float[2][2] (était "float P = {{0,0},{0,0}}" → type invalide) ***
+// *** CORRECTION 2 : K calculé correctement avec K[0] = P[0][0]/S et K[1] = P[1][0]/S ***
+struct Kalman1D {
+  float Q_angle   = 0.001f;
+  float Q_bias    = 0.003f;
+  float R_measure = 0.03f;
+  float angle = 0.0f;
+  float bias  = 0.0f;
+  float P[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};  // CORRIGÉ : tableau 2×2
+
+  float update(float newAngle, float newRate, float dt) {
+    // Prédiction
+    float rate = newRate - bias;
+    angle += dt * rate;
+
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+
+    // Mise à jour
+    float S = P[0][0] + R_measure;
+    float K[2];
+    K[0] = P[0][0] / S;   // CORRIGÉ : K[0] et K[1] différents
+    K[1] = P[1][0] / S;
+
+    float y = newAngle - angle;
+    if (y >  180.0f) y -= 360.0f;
+    if (y < -180.0f) y += 360.0f;
+
+    angle += K[0] * y;
+    bias  += K[1] * y;
+
+    float P00_temp = P[0][0];
+    float P01_temp = P[0][1];
+    P[0][0] -= K[0] * P00_temp;
+    P[0][1] -= K[0] * P01_temp;
+    P[1][0] -= K[1] * P00_temp;
+    P[1][1] -= K[1] * P01_temp;
+
+    if (angle >= 360.0f) angle -= 360.0f;
+    if (angle <   0.0f)  angle += 360.0f;
+    return angle;
+  }
+};
+Kalman1D fKalman;
+
+// --- GESTION SERVEUR ET COMMANDES ---
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+WebServer server(80);
+String commandeEnCours = "stop";
+bool sequence1Active = false;
+
+// Calibration magnétomètre
+float dynamic_X_OFFSET = -2237.0; float dynamic_Y_OFFSET = 1026.5;
+float dynamic_X_SCALE  =  1169.0; float dynamic_Y_SCALE  = 1285.5;
+
+// *** CORRECTION 3 : déclarations avancées pour que mettreAJourOdometrie puisse les utiliser ***
+long ticksOdoDroitPrev  = 0;
+long ticksOdoGauchePrev = 0;
+
+// --- DÉCLARATIONS ANTICIPÉES ---
+void executerFiltreKalman();
+void mettreAJourOdometrie();
+void stopMoteurs();
+
+// --- FONCTIONS MOTEURS BAS NIVEAU ---
+void stopMoteurs() {
+  ledcWrite(canalDroit, 0);
+  ledcWrite(canalGauche, 0);
+  digitalWrite(IN_1_D, LOW); digitalWrite(IN_2_D, LOW);
+  digitalWrite(IN_1_G, LOW); digitalWrite(IN_2_G, LOW);
+}
+
+// --- FONCTIONS NAVIGATION ---
+
+void transitionVirageSerre(float angleVouluRelatif) {
+  float cibleCap = capInitialAuReset + angleVouluRelatif;
+  while (cibleCap <    0) cibleCap += 360;
+  while (cibleCap >= 360) cibleCap -= 360;
+
+  bool gauche = angleVouluRelatif > (capGlobal - capInitialAuReset);
+
+  while (abs(capGlobal - cibleCap) > 4.0) {
+    executerFiltreKalman();
+    mettreAJourOdometrie();
+
+    if (gauche) {
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); // Droite AV
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); // Gauche AR
+      ledcWrite(canalDroit,  PWR_ROT_SERRE);
+      ledcWrite(canalGauche, PWR_ROT_SERRE / 2);
+    } else {
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);  // Droite AR
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);  // Gauche AV
+      ledcWrite(canalDroit,  PWR_ROT_SERRE / 2);
+      ledcWrite(canalGauche, PWR_ROT_SERRE);
+    }
+    delay(10);
+  }
+  stopMoteurs();
+}
+
+void suivreLignePrecision(float xB, float yB, int pwrBase) {
+  float dist = 100.0;
+  while (dist > 1.0) {
+    executerFiltreKalman();
+    mettreAJourOdometrie();
+
+    float dx = xB - x_stylo;
+    float dy = yB - y_stylo;
+    dist = sqrt(dx * dx + dy * dy);
+
+    float capCible = atan2(dy, dx) * 180.0 / PI;
+    float erreurCap = capCible - (capGlobal - capInitialAuReset);
+
+    while (erreurCap >  180) erreurCap -= 360;
+    while (erreurCap < -180) erreurCap += 360;
+
+    int correction = (int)(erreurCap * K_P_CAP);
+
+    digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+    digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+    ledcWrite(canalDroit,  constrain(pwrBase - correction, 0, 255));
+    ledcWrite(canalGauche, constrain(pwrBase + correction, 0, 255));
+
+    if (commandeEnCours == "stop") return;
+    delay(10);
+  }
+  stopMoteurs();
+}
+
+void executerSequenceEscalier() {
+  Serial.println("Lancement Escalier...");
+
+  // Segment 1 : 20 cm en avant (X)
+  suivreLignePrecision(20.0, 0.0, 180);
+
+  // Virage 1 : 90° à gauche
+  transitionVirageSerre(90.0);
+
+  // Segment 2 : 10 cm vers le haut (Y)
+  suivreLignePrecision(20.0, 10.0, 150);
+
+  // Virage 2 : 90° à droite (retour cap 0°)
+  transitionVirageSerre(0.0);
+
+  // Segment 3 : 40 cm en avant (X)
+  suivreLignePrecision(60.0, 10.0, 180);
+
+  commandeEnCours = "stop";
+  stopMoteurs();
+  Serial.println("Séquence terminée.");
+}
+
+// --- LOGIQUE CAPTEURS ---
+
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); Wire.write(reg | 0x80); Wire.endTransmission(false);
+  Wire.requestFrom(addr, (uint8_t)2);
+  return (int16_t)(Wire.read() | (Wire.read() << 8));
+}
+
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x7E);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00);
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
+}
+
+void calibrerGyro() {
+  long somme = 0;
+  for (int i = 0; i < 300; i++) { somme += myIMU.readRawGyroZ(); delay(4); }
+  gyroBiasZ = (float)somme / 300.0;
+}
+
+float obtenirCapMagnetometre() {
+  int16_t mx = read16(LIS3MDL_ADDR, 0x28);
+  int16_t my = read16(LIS3MDL_ADDR, 0x2A);
+  float nx = (mx - dynamic_X_OFFSET) / dynamic_X_SCALE;
+  float ny = (my - dynamic_Y_OFFSET) / dynamic_Y_SCALE;
+  float cap = atan2(-ny, nx) * 180.0 / PI;
+  if (cap < 0) cap += 360.0;
+  return cap;
+}
+
+void executerFiltreKalman() {
+  uint32_t maintenant = millis();
+  float dt = (maintenant - tDernierKalman) / 1000.0f;
+  if (dt < 0.005f) return;
+  tDernierKalman = maintenant;
+  float gyroCorrige = myIMU.readRawGyroZ() - gyroBiasZ;
+  float vitesseAngulaireZ = gyroCorrige * 4.375f / 1000.0f;
+  capGlobal = fKalman.update(obtenirCapMagnetometre(), vitesseAngulaireZ, dt);
+}
+
+void reinitialiserRepereCartesien() {
+  noInterrupts();
+  pasDroit = 0; pasGauche = 0;
+  ticksOdoDroit = 0; ticksOdoGauche = 0;
+  ticksOdoDroitPrev = 0; ticksOdoGauchePrev = 0;
+  interrupts();
+  capInitialAuReset = capGlobal;
+  Centre_Robot_X = -DISTANCE_MI_ENTRAXE_STYLO;
+  Centre_Robot_Y = 0.0;
+  x_stylo = 0.0;
+  y_stylo = 0.0;
+  capGlobalPrev = capGlobal;
+}
+
+void mettreAJourOdometrie() {
+  if (millis() - tDerniereOdo < 10) return;
+  tDerniereOdo = millis();
+
+  noInterrupts();
+  long actuelsD = ticksOdoDroit;
+  long actuelsG = ticksOdoGauche;
+  interrupts();
+
+  long dTicksD = actuelsD - ticksOdoDroitPrev;
+  long dTicksG = actuelsG - ticksOdoGauchePrev;
+  ticksOdoDroitPrev  = actuelsD;
+  ticksOdoGauchePrev = actuelsG;
+
+  float distD = (float)dTicksD * CM_PAR_TICK;
+  float distG = (float)dTicksG * CM_PAR_TICK;
+  float deltaDCentre = (distD + distG) / 2.0;
+
+  float capRad = (capGlobal - capInitialAuReset) * PI / 180.0;
+  Centre_Robot_X += deltaDCentre * cos(capRad);
+  Centre_Robot_Y += deltaDCentre * sin(capRad);
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capRad);
+}
+
+// --- INTERFACE HTML ---
+const char PAGE_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>Draw_GOAAAT</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: #111; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; gap: 16px; padding: 20px; }
+    h1 { font-size: 1.4rem; color: #0af; }
+    .grid { display: grid; grid-template-columns: repeat(3, 90px); gap: 10px; }
+    .btn { background: #222; border: 2px solid #444; border-radius: 14px; color: #fff; font-size: 2rem; height: 90px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+    .btn:active, .btn.pressed { background: #0af; border-color: #0af; color: #000; }
+    #btn-seq1 { background: #d40; border: 2px solid #f60; color: #fff; font-weight: bold; padding: 15px; width: 290px; border-radius: 12px; margin-top: 10px; cursor: pointer; }
+    #btn-cart-reset { background: #058; border: 2px solid #08f; color: #fff; padding: 12px; width: 290px; border-radius: 12px; cursor: pointer; }
+    .data-box { background: #1a1a1a; border: 1px solid #333; border-radius: 16px; padding: 14px; width: 290px; }
+    .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+    .data-val { font-family: monospace; text-align: right; color: #0f8; }
+  </style>
+</head>
+<body>
+  <h1>🤖 Draw_GOAAAT</h1>
+  <div class="grid">
+    <div class="btn" data-cmd="vag">↖</div><div class="btn" data-cmd="avancer">⬆</div><div class="btn" data-cmd="vad">↗</div>
+    <div class="btn" data-cmd="rotation_gauche">↺</div><div class="btn" style="background:#f44" data-cmd="stop">■</div><div class="btn" data-cmd="rotation_droite">↻</div>
+    <div class="btn" data-cmd="veg">↙</div><div class="btn" data-cmd="reculer">⬇</div><div class="btn" data-cmd="ved">↘</div>
+  </div>
+  <button id="btn-seq1" onclick="send('sequence1')">📏 LANCER ESCALIER</button>
+  <button id="btn-cart-reset" onclick="fetch('/cartesian/reset')">🎯 Reset Repère</button>
+  <div class="data-box">
+    <div class="data-grid">
+      <span>Stylo X (mm)</span> <span class="data-val" id="sx">—</span>
+      <span>Stylo Y (mm)</span> <span class="data-val" id="sy">—</span>
+      <span>Cap (°)</span>      <span class="data-val" id="cap">—</span>
+    </div>
+  </div>
+  <script>
+    function send(cmd) { fetch('/cmd?action=' + cmd); }
+    document.querySelectorAll('.btn').forEach(btn => {
+      btn.onmousedown  = () => send(btn.dataset.cmd);
+      btn.onmouseup   = () => send('stop');
+      btn.ontouchstart = (e) => { e.preventDefault(); send(btn.dataset.cmd); };
+      btn.ontouchend  = () => send('stop');
+    });
+    setInterval(async () => {
+      const r = await fetch('/pos'); const d = await r.json();
+      document.getElementById('sx').textContent  = d.sx.toFixed(1);
+      document.getElementById('sy').textContent  = d.sy.toFixed(1);
+      document.getElementById('cap').textContent = d.cap.toFixed(1);
+    }, 200);
+  </script>
+</body>
+</html>
+)rawhtml";
+
+void handleCmd() {
+  if (server.hasArg("action")) {
+    String action = server.arg("action");
+    if (action == "sequence1") sequence1Active = true;
+    else { sequence1Active = false; commandeEnCours = action; }
+  }
+  server.send(200, "text/plain", "ok");
+}
+
+// *** CORRECTION 4 : "char json;" remplacé par "char json[128]" (buffer d'un seul octet → dépassement mémoire) ***
+void handlePositions() {
+  char json[128];
+  snprintf(json, sizeof(json),
+    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.2f}",
+    Centre_Robot_X * 10.0, Centre_Robot_Y * 10.0,
+    x_stylo * 10.0,        y_stylo * 10.0,
+    capGlobal - capInitialAuReset);
+  server.send(200, "application/json", json);
+}
+
+// --- SETUP ET LOOP ---
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT);
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
+  ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
+
+  pinMode(ENC_D_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
+  pinMode(ENC_G_CH_A, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
+
+  WiFi.softAP(ssid, password);
+  server.on("/",               [](){ server.send_P(200, "text/html", PAGE_HTML); });
+  server.on("/cmd",            handleCmd);
+  server.on("/pos",            handlePositions);
+  server.on("/cartesian/reset",[](){ reinitialiserRepereCartesien(); server.send(200, "text/plain", "ok"); });
+  server.begin();
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  initLIS3MDL();
+  if (myIMU.begin() == 0) calibrerGyro();
+
+  reinitialiserRepereCartesien();
+}
+
+void loop() {
+  server.handleClient();
+  executerFiltreKalman();
+  mettreAJourOdometrie();
+
+  if (sequence1Active) {
+    executerSequenceEscalier();
+    sequence1Active = false;
+  } else {
+    if (commandeEnCours == "avancer") {
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit, PWR_DROIT_AV); ledcWrite(canalGauche, PWR_GAUCHE_AV);
+    }
+    else if (commandeEnCours == "reculer") {
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit, PWR_DROIT_AR); ledcWrite(canalGauche, PWR_GAUCHE_AR);
+    }
+    else if (commandeEnCours == "rotation_droite") {
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+      ledcWrite(canalDroit, PWR_VIRAGE); ledcWrite(canalGauche, PWR_VIRAGE);
+    }
+    else if (commandeEnCours == "rotation_gauche") {
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+      ledcWrite(canalDroit, PWR_VIRAGE); ledcWrite(canalGauche, PWR_VIRAGE);
+    }
+    else if (commandeEnCours == "stop") {
+      stopMoteurs();
+    }
+  }
+}
