@@ -46,13 +46,19 @@ const int resolution  = 8;
 const int canalDroit  = 0;
 const int canalGauche = 1;
 
+const float CALIB_X_OFFSET = -2045.0;
+const float CALIB_Y_OFFSET =   654.0;
+const float CALIB_X_SCALE  =  1857.0;
+const float CALIB_Y_SCALE  =  1922.0;
+
 // --- PARAMÈTRES DE PUISSANCE ---
-const int PWR_DROIT_AV  = 200;
-const int PWR_GAUCHE_AV = 208;
-const int PWR_DROIT_AR  = 194;
-const int PWR_GAUCHE_AR = 200;
-const int PWR_VIRAGE    = 210;
-const int PWR_ROT_SERRE = 120;
+// --- PARAMÈTRES DE PUISSANCE (Augmentés de 10) ---
+const int PWR_DROIT_AV  = 220; // Était 200
+const int PWR_GAUCHE_AV = 228; // Était 208
+const int PWR_DROIT_AR  = 214; // Était 194
+const int PWR_GAUCHE_AR = 220; // Était 200
+const int PWR_VIRAGE    = 230; // Était 210
+const int PWR_ROT_SERRE = 140; // Était 120
 
 const float TICKS_PAR_TOUR = 1050.0;
 const float DIAM_ROUE_CM   = 9.0;
@@ -69,8 +75,20 @@ float x_stylo = 0.0;
 float y_stylo = 0.0;
 float capInitialAuReset = 0.0;
 
+const float Kp = 0.7f, Kd = 0.3f;
+long   ecartPrecedent      = 0;
+int    correctionDynamique = 0;
+uint32_t tDerniereCorr     = 0;
+
+
+float normaliserAngle360(float a) {
+  while (a >= 360.0f) a -= 360.0f;
+  while (a < 0.0f)    a += 360.0f;
+  return a;
+}
+
 // --- PARAMÈTRES ASSERVISSEMENT ---
-const float K_P_CAP    = 3.5;
+const float K_P_CAP    = 1.2;
 const float K_CTE      = 2.0;
 const float ZONE_VIRAGE_CM = 1.5;
 
@@ -87,7 +105,7 @@ struct Kalman1D {
   float R_measure = 0.03f;
   float angle = 0.0f;
   float bias  = 0.0f;
-  float P[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};  // CORRIGÉ : tableau 2×2
+  float P[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
 
   float update(float newAngle, float newRate, float dt) {
     // Prédiction
@@ -119,8 +137,8 @@ struct Kalman1D {
     P[1][0] -= K[1] * P00_temp;
     P[1][1] -= K[1] * P01_temp;
 
-    if (angle >= 360.0f) angle -= 360.0f;
-    if (angle <   0.0f)  angle += 360.0f;
+while (angle >= 360.0f) angle -= 360.0f;
+while (angle <   0.0f)  angle += 360.0f;
     return angle;
   }
 };
@@ -157,24 +175,32 @@ void stopMoteurs() {
 // --- FONCTIONS NAVIGATION ---
 
 void transitionVirageSerre(float angleVouluRelatif) {
-  float cibleCap = capInitialAuReset + angleVouluRelatif;
-  while (cibleCap <    0) cibleCap += 360;
-  while (cibleCap >= 360) cibleCap -= 360;
+  // On s'assure que la cible est entre 0-360
+  float cible = normaliserAngle360(angleVouluRelatif);
+  float erreur = 100.0f;
 
-  bool gauche = angleVouluRelatif > (capGlobal - capInitialAuReset);
-
-  while (abs(capGlobal - cibleCap) > 4.0) {
+  while (fabsf(erreur) > 3.0f) {
+    server.handleClient();
     executerFiltreKalman();
     mettreAJourOdometrie();
 
-    if (gauche) {
-      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); // Droite AV
-      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); // Gauche AR
+    float actuel = normaliserAngle360(capGlobal - capInitialAuReset);
+    
+    erreur = cible - actuel;
+    if (erreur > 180)  erreur -= 360;
+    if (erreur < -180) erreur += 360;
+
+    // Si erreur > 0 : la cible est à gauche (CCW), si < 0 : à droite (CW)
+    if (erreur > 0) {
+      // Tourner à gauche
+      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
       ledcWrite(canalDroit,  PWR_ROT_SERRE);
       ledcWrite(canalGauche, PWR_ROT_SERRE / 2);
     } else {
-      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);  // Droite AR
-      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);  // Gauche AV
+      // Tourner à droite
+      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
       ledcWrite(canalDroit,  PWR_ROT_SERRE / 2);
       ledcWrite(canalGauche, PWR_ROT_SERRE);
     }
@@ -186,6 +212,7 @@ void transitionVirageSerre(float angleVouluRelatif) {
 void suivreLignePrecision(float xB, float yB, int pwrBase) {
   float dist = 100.0;
   while (dist > 1.0) {
+    server.handleClient();
     executerFiltreKalman();
     mettreAJourOdometrie();
 
@@ -193,11 +220,17 @@ void suivreLignePrecision(float xB, float yB, int pwrBase) {
     float dy = yB - y_stylo;
     dist = sqrt(dx * dx + dy * dy);
 
+    // 1. Calcul du cap cible en 0-360
     float capCible = atan2(dy, dx) * 180.0 / PI;
-    float erreurCap = capCible - (capGlobal - capInitialAuReset);
+    if (capCible < 0) capCible += 360.0; 
 
-    while (erreurCap >  180) erreurCap -= 360;
-    while (erreurCap < -180) erreurCap += 360;
+    // 2. Calcul du cap actuel relatif (assaini en 0-360)
+    float capRelatif = normaliserAngle360(capGlobal - capInitialAuReset);
+
+    // 3. Calcul de l'erreur la plus courte (pour éviter les demi-tours inutiles)
+    float erreurCap = capCible - capRelatif;
+    if (erreurCap > 180)  erreurCap -= 360;
+    if (erreurCap < -180) erreurCap += 360;
 
     int correction = (int)(erreurCap * K_P_CAP);
 
@@ -211,23 +244,52 @@ void suivreLignePrecision(float xB, float yB, int pwrBase) {
   }
   stopMoteurs();
 }
+void virageAngleDroitStylo(float angleCibleRelatif) {
+    float cible = normaliserAngle360(angleCibleRelatif);
+    float erreur = 100.0f;
+    float ratio = 0.56f; // Rayon interne / Rayon externe
+
+    while (fabsf(erreur) > 1.5f) { // Précision de 1.5 degré
+        executerFiltreKalman();
+        float actuel = normaliserAngle360(capGlobal - capInitialAuReset);
+        erreur = cible - actuel;
+        if (erreur > 180)  erreur -= 360;
+        if (erreur < -180) erreur += 360;
+
+        // On fait tourner les DEUX roues dans le même sens, mais à des vitesses différentes
+        int pwrBase = PWR_VIRAGE; 
+        if (erreur > 0) { // Virage à gauche
+            digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); // Avance
+            digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);  // Avance (vérifie tes sens IN_1/IN_2)
+            ledcWrite(canalDroit, pwrBase);
+            ledcWrite(canalGauche, (int)(pwrBase * ratio)); 
+        } else { // Virage à droite
+            // Inverser les puissances pour que la gauche devienne l'externe
+            ledcWrite(canalDroit, (int)(pwrBase * ratio));
+            ledcWrite(canalGauche, pwrBase);
+        }
+        delay(10);
+    }
+    stopMoteurs();
+}
 
 void executerSequenceEscalier() {
   Serial.println("Lancement Escalier...");
 
-  // Segment 1 : 20 cm en avant (X)
-  suivreLignePrecision(20.0, 0.0, 180);
+  // --- MARCHE 1 ---
+  // Avancer de 20 cm
+  suivreLignePrecision(20.0, 0.0, 180); 
+  // Pivot 90° GAUCHE autour de la pointe du stylo
+  virageAngleDroitStylo(90.0);
 
-  // Virage 1 : 90° à gauche
-  transitionVirageSerre(90.0);
+  // --- MARCHE 2 ---
+  // Monter de 10 cm (Y) à X=20
+  suivreLignePrecision(20.0, 10.0, 160); 
+  // Pivot 90° DROITE (retour au cap 0°) autour du stylo
+  virageAngleDroitStylo(0.0);
 
-  // Segment 2 : 10 cm vers le haut (Y)
-  suivreLignePrecision(20.0, 10.0, 150);
-
-  // Virage 2 : 90° à droite (retour cap 0°)
-  transitionVirageSerre(0.0);
-
-  // Segment 3 : 40 cm en avant (X)
+  // --- MARCHE 3 ---
+  // Final : avancer de 40 cm (X final = 60)
   suivreLignePrecision(60.0, 10.0, 180);
 
   commandeEnCours = "stop";
@@ -310,7 +372,9 @@ void mettreAJourOdometrie() {
 
   float distD = (float)dTicksD * CM_PAR_TICK;
   float distG = (float)dTicksG * CM_PAR_TICK;
-  float deltaDCentre = (distD + distG) / 2.0;
+  float signe = 1.0f;
+if (commandeEnCours == "reculer") signe = -1.0f;
+float deltaDCentre = signe * (distD + distG) / 2.0f;
 
   float capRad = (capGlobal - capInitialAuReset) * PI / 180.0;
   Centre_Robot_X += deltaDCentre * cos(capRad);
@@ -379,12 +443,19 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
 void handleCmd() {
   if (server.hasArg("action")) {
     String action = server.arg("action");
-    if (action == "sequence1") sequence1Active = true;
-    else { sequence1Active = false; commandeEnCours = action; }
+    if (action == "sequence1") {
+      sequence1Active = true;
+    } else {
+      if (action != commandeEnCours) {
+        noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+        ecartPrecedent = 0; correctionDynamique = 0;
+      }
+      sequence1Active = false;
+      commandeEnCours = action;
+    }
   }
-  server.send(200, "text/plain", "ok");
 }
-
+  
 // *** CORRECTION 4 : "char json;" remplacé par "char json[128]" (buffer d'un seul octet → dépassement mémoire) ***
 void handlePositions() {
   char json[128];
@@ -394,6 +465,18 @@ void handlePositions() {
     x_stylo * 10.0,        y_stylo * 10.0,
     capGlobal - capInitialAuReset);
   server.send(200, "application/json", json);
+}
+
+
+void corrigerPD() {
+    if (commandeEnCours == "stop") { correctionDynamique = 0; return; }
+    if (millis() - tDerniereCorr < 10) return;
+    tDerniereCorr = millis();
+
+    noInterrupts(); long tD = pasDroit; long tG = pasGauche; interrupts();
+    long ecart = tD - tG;
+    correctionDynamique = (int)(ecart * Kp + (ecart - ecartPrecedent) * Kd);
+    ecartPrecedent = ecart;
 }
 
 // --- SETUP ET LOOP ---
@@ -422,8 +505,13 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   initLIS3MDL();
   if (myIMU.begin() == 0) calibrerGyro();
+// AJOUT — sans ça, dt au premier appel ≈ 300-500ms au lieu de 5ms
+capGlobal = obtenirCapMagnetometre(); // Cap de départ
+tDernierKalman = millis();            // Reset du chrono pour Kalman
+capInitialAuReset = capGlobal;        // Référence 0 pour ton repère
 
-  reinitialiserRepereCartesien();
+    reinitialiserRepereCartesien();
+    
 }
 
 void loop() {
@@ -435,16 +523,20 @@ void loop() {
     executerSequenceEscalier();
     sequence1Active = false;
   } else {
-    if (commandeEnCours == "avancer") {
-      digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
-      digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
-      ledcWrite(canalDroit, PWR_DROIT_AV); ledcWrite(canalGauche, PWR_GAUCHE_AV);
-    }
-    else if (commandeEnCours == "reculer") {
-      digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
-      digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
-      ledcWrite(canalDroit, PWR_DROIT_AR); ledcWrite(canalGauche, PWR_GAUCHE_AR);
-    }
+corrigerPD();
+
+if (commandeEnCours == "avancer") {
+  digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
+  digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
+  ledcWrite(canalDroit,  constrain(PWR_DROIT_AV  - correctionDynamique, 0, 255));
+  ledcWrite(canalGauche, constrain(PWR_GAUCHE_AV + correctionDynamique, 0, 255));
+}
+else if (commandeEnCours == "reculer") {
+  digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
+  digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH);
+  ledcWrite(canalDroit,  constrain(PWR_DROIT_AR  - correctionDynamique, 0, 255));
+  ledcWrite(canalGauche, constrain(PWR_GAUCHE_AR + correctionDynamique, 0, 255));
+}
     else if (commandeEnCours == "rotation_droite") {
       digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);
       digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
