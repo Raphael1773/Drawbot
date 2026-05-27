@@ -1,0 +1,336 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h> 
+#include <SparkFunLSM6DS3.h> 
+
+#define LEDU1 25
+#define LEDU2 26
+
+#define EN_D 23
+#define EN_G   4
+
+#define IN_1_D 19
+#define IN_2_D 18
+#define IN_1_G 17
+#define IN_2_G 16
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define LIS3MDL_ADDR 0x1E  
+#define LSM6DS3_ADDR 0x6B  
+
+#define LIS3_CTRL1   0x20
+#define LIS3_CTRL2   0x21
+#define LIS3_CTRL3   0x22
+#define LIS3_CTRL4   0x23
+
+#define LIS3_OUT_X_L 0x28
+#define LIS3_OUT_Y_L 0x2A
+
+LSM6DS3 myIMU(I2C_MODE, LSM6DS3_ADDR);
+
+const char* ssid     = "Draw_GOAAAT";
+const char* password = "12345678";
+
+WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81); 
+
+// Variables de calibration dynamiques
+float dynamic_X_OFFSET = -2045.0; 
+float dynamic_Y_OFFSET =   654.0;
+float dynamic_X_SCALE  =  1857.0;
+float dynamic_Y_SCALE  =  1922.0;
+
+// Variables pour la Machine à États de Calibration (Évite le blocage)
+enum EtatCalib { REPOS, CLIGNOTEMENT, ROTATION_MESURE };
+EtatCalib etatActuel = REPOS;
+
+uint32_t chronoEtape = 0;
+int clignoCompteur = 0;
+int16_t x_min = 32767, x_max = -32768;
+int16_t y_min = 32767, y_max = -32768;
+
+float gyroBiasZ   = 0.0;
+uint32_t tDernierKalman = 0;
+uint32_t tDernierEnvoiWeb = 0;
+float capGlobal = 0.0;
+
+struct Kalman1D {
+  float Q_angle = 0.001f;  
+  float Q_bias  = 0.003f;  
+  float R_measure = 0.03f; 
+  float angle = 0.0f; 
+  float bias  = 0.0f; 
+  float P[2][2] = {{0, 0}, {0, 0}};
+
+  float update(float newAngle, float newRate, float dt) {
+    float rate = newRate - bias;
+    angle += dt * rate;
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q_angle);
+    P[0][1] -= dt * P[1][1];
+    P[1][0] -= dt * P[1][1];
+    P[1][1] += Q_bias * dt;
+    float S = P[0][0] + R_measure;
+    float K[2]; 
+    K[0] = P[0][0] / S; K[1] = P[1][0] / S;
+    float y = newAngle - angle;
+    if (y > 180.0f)  y -= 360.0f;
+    if (y < -180.0f) y += 360.0f;
+    angle += K[0] * y; bias += K[1] * y;
+    float P00_temp = P[0][0]; float P01_temp = P[0][1];
+    P[0][0] -= K[0] * P00_temp; P[0][1] -= K[0] * P01_temp;
+    P[1][0] -= K[1] * P00_temp; P[1][1] -= K[1] * P01_temp;
+    if (angle >= 360.0f) angle -= 360.0f;
+    if (angle < 0.0f)    angle += 360.0f;
+    return angle;
+  }
+};
+Kalman1D fKalman;
+
+// Interface web graphique
+const char PAGE_DIAG[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>GOAAAT - Calibration Non-Bloquante</title>
+  <style>
+    body { background: #121212; color: #00ffcc; font-family: monospace; padding: 20px; text-align: center;}
+    h1 { color: #fff; font-size: 1.5rem; margin-bottom: 5px; }
+    .btn-calib { background: #ff0055; color: white; font-family: monospace; font-size: 1.1rem; font-weight: bold; border: none; padding: 15px 30px; border-radius: 5px; cursor: pointer; margin: 15px auto; display: block; box-shadow: 0 0 15px rgba(255,0,85,0.4); transition: 0.2s; }
+    .btn-calib:hover { background: #ff3377; transform: scale(1.02); }
+    .btn-calib:active { transform: scale(0.98); }
+    .console { background: #000; border: 2px solid #333; border-radius: 8px; padding: 15px; margin: 20px auto; max-width: 650px; text-align: left; height: 350px; overflow-y: scroll; font-size: 0.9rem; line-height: 1.4; color: #fff;}
+    .val { color: #ff00ff; font-weight: bold; }
+    .cal { color: #00f0ff; font-weight: bold; background: #112233; padding: 2px 5px; border-radius: 3px; }
+    .cap { color: #00ff00; font-weight: bold; font-size: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>🔄 Calibration Fluide du LIS3MDL</h1>
+  <p>Statut Flux : <span id="status" style="color:red">Déconnecté</span></p>
+  
+  <button class="btn-calib" id="btn-run" onclick="demanderCalibration()">🚀 LANCER LA ROTATION AUTO</button>
+  
+  <div class="console" id="log-box">Connexion en cours...<br></div>
+
+  <script>
+    const box = document.getElementById('log-box');
+    const btn = document.getElementById('btn-run');
+    const ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+    
+    ws.onopen = () => { document.getElementById('status').textContent = 'Connecté (Prêt)'; document.getElementById('status').style.color = 'green'; };
+    ws.onclose = () => { document.getElementById('status').textContent = 'Déconnecté'; document.getElementById('status').style.color = 'red'; };
+    
+    ws.onmessage = (event) => {
+      let data = event.data;
+      if (data.includes("STARTING_ROTATION")) {
+        btn.disabled = true;
+        btn.style.background = "#555";
+        btn.textContent = "🔄 ROTATION EN COURS...";
+        box.innerHTML = "<b style='color:#ff0055'>[ESP32] Rotation démarrée ! Traitement réseau actif...</b><br>" + box.innerHTML;
+        return;
+      }
+      if (data.includes("ENDING_ROTATION")) {
+        btn.disabled = false;
+        btn.style.background = "#ff0055";
+        btn.textContent = "🚀 LANCER LA ROTATION AUTO";
+        box.innerHTML = "<b style='color:#00ff00'>[ESP32] Séquence réussie ! Coefficients calculés.</b><br>" + box.innerHTML;
+        return;
+      }
+      
+      box.innerHTML = data + "<br>" + box.innerHTML;
+      if(box.innerHTML.split("<br>").length > 60) {
+        box.innerHTML = box.innerHTML.split("<br>").slice(0, 60).join("<br>");
+      }
+    };
+
+    function demanderCalibration() {
+      ws.send("START_CALIB");
+    }
+  </script>
+</body>
+</html>
+)rawhtml";
+
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission(); 
+}
+
+int16_t read16(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr); 
+  Wire.write(reg | 0x80); 
+  if (Wire.endTransmission(false) != 0) return 0;
+  Wire.requestFrom(addr, (uint8_t)2);
+  if (Wire.available() < 2) return 0;
+  return (int16_t)(Wire.read() | (Wire.read() << 8)); 
+}
+
+void initLIS3MDL() {
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL1, 0x7E); 
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL2, 0x00); 
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL3, 0x00); 
+  writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C); 
+}
+
+void calibrerGyro() {
+  long somme = 0;
+  for (int i = 0; i < 300; i++) { somme += myIMU.readRawGyroZ(); delay(4); }
+  gyroBiasZ = (float)somme / 300.0;
+}
+
+float obtenirCapBrut(int16_t mx, int16_t my, float &nx_out, float &ny_out) {
+  nx_out = (mx - dynamic_X_OFFSET) / dynamic_X_SCALE;
+  ny_out = (my - dynamic_Y_OFFSET) / dynamic_Y_SCALE;
+  float cap = atan2(-ny_out, nx_out) * 180.0 / PI;
+  if (cap < 0) cap += 360.0;
+  return cap;
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_TEXT) {
+    String message = String((char*)payload);
+    if (message == "START_CALIB" && etatActuel == REPOS) {
+      // Déclenche le début de la machine à états
+      webSocket.broadcastTXT("STARTING_ROTATION");
+      x_min = 32767; x_max = -32768;
+      y_min = 32767; y_max = -32768;
+      clignoCompteur = 0;
+      chronoEtape = millis();
+      etatActuel = CLIGNOTEMENT;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LEDU1, OUTPUT); pinMode(LEDU2, OUTPUT); 
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+  ledcSetup(0, 5000, 8); ledcAttachPin(EN_D, 0);
+  ledcSetup(1, 5000, 8); ledcAttachPin(EN_G, 1);
+
+  Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(400000); 
+  initLIS3MDL();
+  myIMU.begin();
+  calibrerGyro();
+
+  WiFi.softAP(ssid, password);
+  server.on("/", []() { server.send_P(200, "text/html", PAGE_DIAG); });
+  server.begin();
+  
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent); 
+
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_Y_L);
+  float dummyX, dummyY;
+  capGlobal = obtenirCapBrut(mx, my, dummyX, dummyY);
+  fKalman.angle = capGlobal;
+  
+  tDernierKalman = millis();
+  tDernierEnvoiWeb = millis();
+}
+
+void loop() {
+  // Ces deux fonctions s'exécutent désormais en boucle continue sans AUCUN obstacle
+  server.handleClient();
+  webSocket.loop();
+
+  uint32_t maintenant = millis();
+
+  // =========================================================================
+  // GESTION NON-BLOQUANTE DE LA SEQUENCE DE CALIBRATION (Machine à États)
+  // =========================================================================
+  switch (etatActuel) {
+    
+    case CLIGNOTEMENT:
+      // Fait clignoter les LED toutes les 375ms sans bloquer le code
+      if (maintenant - chronoEtape >= 375) {
+        chronoEtape = maintenant;
+        digitalWrite(LEDU1, !digitalRead(LEDU1));
+        digitalWrite(LEDU2, !digitalRead(LEDU2));
+        clignoCompteur++;
+        
+        if (clignoCompteur >= 4) { // Fin des 1.5 secondes de sécurité
+          digitalWrite(LEDU1, HIGH); digitalWrite(LEDU2, HIGH);
+          
+          // Allumage moteurs à 200 de puissance
+          digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); 
+          digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); 
+          ledcWrite(0, 200); 
+          ledcWrite(1, 200); 
+          
+          chronoEtape = maintenant; // Reset chrono pour mesurer la rotation
+          etatActuel = ROTATION_MESURE;
+        }
+      }
+      break;
+
+    case ROTATION_MESURE:
+      // Lit le capteur en continu au fil de l'eau
+      int16_t mx_raw, my_raw;
+      mx_raw = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+      my_raw = read16(LIS3MDL_ADDR, LIS3_OUT_Y_L);
+
+      if (mx_raw < x_min) x_min = mx_raw;
+      if (mx_raw > x_max) x_max = mx_raw;
+      if (my_raw < y_min) y_min = my_raw;
+      if (my_raw > y_max) y_max = my_raw;
+
+      // Arrêt automatique après 4000ms (4 secondes)
+      if (maintenant - chronoEtape >= 4000) {
+        ledcWrite(0, 0); ledcWrite(1, 0); // Stop moteurs immédiatement
+        digitalWrite(LEDU2, LOW);
+
+        // Calcul des constantes réelles finales
+        dynamic_X_OFFSET = (float)(x_max + x_min) / 2.0f;
+        dynamic_Y_OFFSET = (float)(y_max + y_min) / 2.0f;
+        dynamic_X_SCALE  = (float)(x_max - x_min) / 2.0f;
+        dynamic_Y_SCALE  = (float)(y_max - y_min) / 2.0f;
+
+        webSocket.broadcastTXT("ENDING_ROTATION");
+        etatActuel = REPOS; // Retour à l'état d'attente initial
+      }
+      break;
+
+    case REPOS:
+    default:
+      break;
+  }
+
+  // =========================================================================
+  // FILTRE DE KALMAN & CAP (S'exécute normalement en tâche de fond)
+  // =========================================================================
+  float dt = (maintenant - tDernierKalman) / 1000.0f;
+  int16_t mx = read16(LIS3MDL_ADDR, LIS3_OUT_X_L);
+  int16_t my = read16(LIS3MDL_ADDR, LIS3_OUT_Y_L);
+  float nX = 0, nY = 0;
+  float capBrut = obtenirCapBrut(mx, my, nX, nY);
+
+  if (dt >= 0.005f) {
+    tDernierKalman = maintenant;
+    float gyroCorrige = myIMU.readRawGyroZ() - gyroBiasZ;
+    float vitesseAngulaireZ = gyroCorrige * 4.375f / 1000.0f; 
+    capGlobal = fKalman.update(capBrut, vitesseAngulaireZ, dt);
+  }
+
+  // Envoi des paquets à l'écran toutes les 250ms
+  if (maintenant - tDernierEnvoiWeb > 250) {
+    tDernierEnvoiWeb = maintenant;
+    
+    char paquet[250];
+    snprintf(paquet, sizeof(paquet), 
+      "<span class='cal'>[CALIB ACTUELLE] X_OFF: %.1f | Y_OFF: %.1f | X_SCA: %.1f | Y_SCA: %.1f</span><br>"
+      "BRUT: %d,%d | NORM: <span class='val'>%.2f,%.2f</span> | Cap Brut: %.1f° | Kalman: <span class='cap'>%.1f°</span>", 
+      dynamic_X_OFFSET, dynamic_Y_OFFSET, dynamic_X_SCALE, dynamic_Y_SCALE,
+      mx, my, nX, nY, capBrut, capGlobal);
+      
+    webSocket.broadcastTXT(paquet); 
+    Serial.println(paquet);
+  }
+}
