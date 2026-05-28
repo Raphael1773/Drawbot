@@ -1,0 +1,568 @@
+/*
+ * =============================================================================
+ * DRAW GOAT v2 — Séquence ESCALIER corrigée
+ * =============================================================================
+ * CORRECTIONS APPORTÉES PAR RAPPORT AU CODE ORIGINAL :
+ *
+ *  1. ENCODEURS AVEC DIRECTION (critique)
+ *     - Original : ISR ne faisait que "++" → direction inconnue, position corrompue en virage
+ *     - Corrigé  : décodage quadrature ×4 sur les 2 canaux A et B (comme Julien)
+ *                  TICKS_PAR_TOUR passe de 1050 à 4200
+ *
+ *  2. ANGLE PAR ENCODEURS, PAS PAR GYRO (critique)
+ *     - Original : intégration pure du gyro → dérive cumulative après chaque rotation
+ *     - Corrigé  : angle calculé par différence d'encodeurs (dD - dG) / ENTRAXE
+ *                  identique à la formule du code Julien, sans dérive
+ *
+ *  3. TRANSITIONS SANS delay() (critique)
+ *     - Original : delay(300) dans la machine à états → odométrie aveugle pendant 300ms
+ *     - Corrigé  : fonction transitionPrete() avec timestamp non bloquant
+ *                  → odométrie et serveur web continuent de tourner pendant la pause
+ *
+ *  4. FILTRE PASSE-BAS ALPHA = 0.6 au lieu de 0.15
+ *     - Original : ALPHA=0.15 trop lent → robot dépasse les coins avant détection
+ *     - Corrigé  : ALPHA=0.6 réactif sans bruit excessif
+ *
+ *  5. SIGNE DE CORRECTION suivreLigne INVERSÉ
+ *     - Original : pG = BASE + correction, pD = BASE - correction → corrigeait dans le mauvais sens
+ *     - Corrigé  : pG = BASE - correction, pD = BASE + correction
+ *
+ * SÉQUENCE ESCALIER (identique à escalier() du code Julien, en cm au lieu de mm) :
+ *   (0,0) → (15,0)  : avancer en X, stylo sur Y=0
+ *   (15,0) → (15,20): monter en Y, stylo sur X=15
+ *   (15,20)→ (35,20): avancer en X, stylo sur Y=20
+ * =============================================================================
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <SparkFunLSM6DS3.h>
+
+// =============================================================================
+// CONFIGURATION MATÉRIELLE — Broches ESP32
+// =============================================================================
+#define EN_D     23   // Enable moteur droit  (PWM via canal LEDC 0)
+#define EN_G      4   // Enable moteur gauche (PWM via canal LEDC 1)
+#define IN_1_D   19   // Sens moteur droit  — fil 1
+#define IN_2_D   18   // Sens moteur droit  — fil 2
+#define IN_1_G   17   // Sens moteur gauche — fil 1
+#define IN_2_G   16   // Sens moteur gauche — fil 2
+
+// Encodeurs : 2 canaux par roue pour le décodage quadrature (direction)
+// CORRECTION 1 : ajout des canaux B (manquants dans le code original)
+#define ENC_G_CH_A  32   // Canal A encodeur gauche
+#define ENC_G_CH_B  33   // Canal B encodeur gauche  ← AJOUTÉ
+#define ENC_D_CH_A  27   // Canal A encodeur droit
+#define ENC_D_CH_B  14   // Canal B encodeur droit   ← AJOUTÉ
+
+// =============================================================================
+// CONSTANTES PHYSIQUES
+// =============================================================================
+const float DISTANCE_STYLO_CM = 12.70; // Distance centre robot → stylo (cm)
+const float DIAM_ROUE_CM      =  9.0;  // Diamètre de la roue (cm)
+const float ENTRAXE_CM        =  8.0;  // Distance entre les deux roues (cm) — À MESURER !
+
+// CORRECTION 1 (suite) : avec décodage quadrature ×4, on détecte 4 fronts par encoche
+// 1050 encoches physiques × 4 = 4200 ticks par tour
+const float TICKS_PAR_TOUR = 4200.0;
+// → 0.00673 cm/tick, identique à MMPARPAS du code Julien (0.0673 mm/tick)
+const float CM_PAR_TICK = (PI * DIAM_ROUE_CM) / TICKS_PAR_TOUR;
+
+// =============================================================================
+// VARIABLES ENCODEURS
+// volatile car modifiées dans les routines d'interruption (ISR)
+// =============================================================================
+volatile long pasDroit  = 0;
+volatile long pasGauche = 0;
+// États précédents pour l'algorithme de décodage quadrature
+volatile int lastEncodedG = 0;
+volatile int lastEncodedD = 0;
+
+long pasDroitPrev  = 0;
+long pasGauchePrev = 0;
+
+// =============================================================================
+// VARIABLES ODOMÉTRIE
+// =============================================================================
+// Position du centre du robot dans le repère absolu (cm)
+// Initialisé à (-DISTANCE_STYLO, 0) pour que le stylo parte de (0,0)
+float Centre_Robot_X = -DISTANCE_STYLO_CM;
+float Centre_Robot_Y = 0.0;
+
+// Cap du robot en degrés (calculé par encodeurs, pas par gyro — correction 2)
+float capGlobal  = 0.0; // cap courant
+float capInitial = 0.0; // cap au moment du dernier reset repère
+
+// Position du stylo (brute puis filtrée passe-bas)
+float x_stylo = 0.0, y_stylo = 0.0; // position brute
+float x_s_f   = 0.0, y_s_f   = 0.0; // position filtrée
+
+// CORRECTION 4 : ALPHA = 0.6 au lieu de 0.15
+// 0.15 était trop lent → le robot dépassait les coins de l'escalier
+// 0.6 : réactif mais lisse suffisamment le bruit des encodeurs
+const float ALPHA = 0.6;
+
+uint32_t tDerniereOdo = 0;
+
+// =============================================================================
+// VARIABLES PID
+// =============================================================================
+const int   PWR_BASE  = 180; // Puissance moteur de base (0–255)
+const int   PWR_MIN   = 150; // Puissance minimale pour vaincre le frottement statique
+const float DEADBAND  = 0.3; // Zone morte sur l'erreur latérale (cm)
+                              // → on ignore les écarts < 3mm pour éviter les micro-oscillations
+
+float Kp_ligne     = 14.0; // Gain proportionnel : correction latérale
+float Kd_ligne     =  5.0; // Gain dérivé : amortit les oscillations autour de la ligne
+float Kp_cap_suivi =  1.5; // Gain sur l'erreur de cap (maintient l'orientation pendant la ligne)
+float erreurLatPrev = 0.0; // Erreur latérale précédente (terme dérivé)
+
+float Kp_rot = 3.5; // Gain proportionnel pour la rotation sur place
+
+// =============================================================================
+// ÉTAT DE LA MACHINE À ÉTATS ESCALIER
+// =============================================================================
+bool   modeAuto       = false;
+int    etapeSeq       = 0;
+String commandeEnCours = "stop";
+
+// CORRECTION 3 : gestion des transitions sans delay()
+// Au lieu de bloquer la boucle, on enregistre le timestamp de début de transition
+// et on attend passivement que le délai soit écoulé.
+bool     enTransition = false;
+uint32_t tTransition  = 0;
+const uint32_t DELAI_TRANSITION_MS = 300; // pause entre étapes (ms)
+
+// Objet IMU (LSM6DS3) — conservé pour monitoring mais ne pilote plus l'angle (correction 2)
+LSM6DS3 myIMU(I2C_MODE, 0x6B);
+
+WebServer server(80);
+
+// =============================================================================
+// ISR ENCODEURS — Décodage quadrature complet (×4)
+// =============================================================================
+// Principe : on encode l'état courant (A,B) sur 2 bits, on le concatène avec
+// l'état précédent pour obtenir un mot de 4 bits. Ce mot identifie de manière
+// unique le sens de rotation (table de vérité identique au code Julien).
+//
+// Les 4 séquences de transition sens + :  1110, 0111, 0001, 1000
+// Les 4 séquences de transition sens - :  1101, 0100, 0010, 1011
+// =============================================================================
+void IRAM_ATTR ISR_Gauche_A() {
+  int a = digitalRead(ENC_G_CH_A);
+  int b = digitalRead(ENC_G_CH_B);
+  int encoded = (a << 1) | b;               // état courant sur 2 bits
+  int sum = (lastEncodedG << 2) | encoded;  // transition : ancien|nouveau sur 4 bits
+  if (sum==0b1110||sum==0b0111||sum==0b0001||sum==0b1000) pasGauche++;
+  if (sum==0b1101||sum==0b0100||sum==0b0010||sum==0b1011) pasGauche--;
+  lastEncodedG = encoded;
+}
+// Canal B déclenche la même ISR (même compteur, même table)
+void IRAM_ATTR ISR_Gauche_B() { ISR_Gauche_A(); }
+
+void IRAM_ATTR ISR_Droit_A() {
+  int a = digitalRead(ENC_D_CH_A);
+  int b = digitalRead(ENC_D_CH_B);
+  int encoded = (a << 1) | b;
+  int sum = (lastEncodedD << 2) | encoded;
+  if (sum==0b1110||sum==0b0111||sum==0b0001||sum==0b1000) pasDroit++;
+  if (sum==0b1101||sum==0b0100||sum==0b0010||sum==0b1011) pasDroit--;
+  lastEncodedD = encoded;
+}
+void IRAM_ATTR ISR_Droit_B() { ISR_Droit_A(); }
+
+// =============================================================================
+// PILOTAGE DES MOTEURS
+// pG, pD  : puissance 0–255
+// avG, avD: true = avant / false = arrière
+// =============================================================================
+void piloterMoteurs(int pG, int pD, bool avG, bool avD) {
+  digitalWrite(IN_1_G, avG ? HIGH : LOW);
+  digitalWrite(IN_2_G, avG ? LOW  : HIGH);
+  digitalWrite(IN_1_D, avD ? LOW  : HIGH); // sens câblage inversé sur le droit
+  digitalWrite(IN_2_D, avD ? HIGH : LOW);
+  ledcWrite(0, constrain(abs(pD), 0, 255));
+  ledcWrite(1, constrain(abs(pG), 0, 255));
+}
+
+// =============================================================================
+// ODOMÉTRIE — Mise à jour à chaque tour de boucle
+// =============================================================================
+void mettreAJourOdometrie() {
+  uint32_t maintenant = millis();
+  float dt = (maintenant - tDerniereOdo) / 1000.0;
+  if (dt < 0.005) return; // on ne met à jour que si ≥ 5ms (évite les divisions par 0)
+  tDerniereOdo = maintenant;
+
+  // Lecture atomique des compteurs (on désactive les interruptions le temps de copier)
+  noInterrupts();
+  long d = pasDroit;
+  long g = pasGauche;
+  interrupts();
+
+  // Distances parcourues depuis la dernière mise à jour (en cm)
+  float dD = (float)(d - pasDroitPrev) * CM_PAR_TICK;
+  float dG = (float)(g - pasGauchePrev) * CM_PAR_TICK;
+  pasDroitPrev = d;
+  pasGauchePrev = g;
+
+  // --- CORRECTION 2 : calcul de l'angle par encodeurs, pas par gyro ---
+  // Formule identique au code Julien :
+  //   Δangle(rad) = (ΔencD - ΔencG) / (ENTRAXE / CM_PAR_TICK)
+  //              = (dD - dG) / ENTRAXE_CM
+  // Cette méthode ne dérive pas (contrairement à l'intégration gyro).
+  float dAngleRad = (dD - dG) / ENTRAXE_CM;
+  capGlobal += dAngleRad * (180.0 / PI); // on travaille en degrés pour la machine à états
+
+  // Mise à jour de la position du centre du robot
+  float capRad    = (capGlobal - capInitial) * PI / 180.0;
+  float deltaDist = (dD + dG) / 2.0;
+  Centre_Robot_X += deltaDist * cos(capRad);
+  Centre_Robot_Y += deltaDist * sin(capRad);
+
+  // Position du stylo : projetée à DISTANCE_STYLO_CM devant le centre
+  x_stylo = Centre_Robot_X + DISTANCE_STYLO_CM * cos(capRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_STYLO_CM * sin(capRad);
+
+  // Filtre passe-bas (ALPHA=0.6 : correction 4)
+  x_s_f = ALPHA * x_stylo + (1.0 - ALPHA) * x_s_f;
+  y_s_f = ALPHA * y_stylo + (1.0 - ALPHA) * y_s_f;
+}
+
+// =============================================================================
+// SUIVI DE LIGNE — PID latéral + correcteur de cap
+//
+// cibleLat : valeur de la coordonnée latérale à maintenir (cm)
+// cibleCap : cap à maintenir (degrés)
+// axeX     : true  → on avance selon X, l'erreur latérale est sur Y (cibleLat = cible Y)
+//            false → on avance selon Y, l'erreur latérale est sur X (cibleLat = cible X)
+// =============================================================================
+void suivreLigne(float cibleLat, float cibleCap, bool axeX) {
+  // Erreur latérale : écart entre la position filtrée et la ligne cible
+  float erreurLat = axeX ? (cibleLat - y_s_f) : (cibleLat - x_s_f);
+
+  // Zone morte : on ignore les petits écarts pour stabiliser le robot sur la ligne
+  if (abs(erreurLat) < DEADBAND) erreurLat = 0;
+
+  // Erreur de cap : normalisée dans [-180°, +180°]
+  float erreurCap = cibleCap - capGlobal;
+  while (erreurCap >  180) erreurCap -= 360;
+  while (erreurCap < -180) erreurCap += 360;
+
+  // Correction = terme proportionnel + terme dérivé (latéral) + terme cap
+  float correction = (erreurLat * Kp_ligne)
+                   + ((erreurLat - erreurLatPrev) * Kd_ligne)
+                   + (erreurCap * Kp_cap_suivi);
+  erreurLatPrev = erreurLat;
+
+  // CORRECTION 5 : signe inversé par rapport au code original
+  // Logique : si erreurLat > 0 (robot trop à gauche)
+  //   → correction > 0 → on accélère le droit (pD+) et freine le gauche (pG-)
+  //   → le robot pivote vers la droite pour revenir sur la ligne ✓
+  // Le code original faisait l'inverse (pG+, pD-) → divergence !
+  int pG = constrain(PWR_BASE - (int)correction, PWR_MIN, 240);
+  int pD = constrain(PWR_BASE + (int)correction, PWR_MIN, 240);
+  piloterMoteurs(pG, pD, true, true);
+}
+
+// =============================================================================
+// ROTATION SUR PLACE vers un angle cible (degrés)
+// Retourne true quand l'erreur angulaire est < 1.5° (atteint)
+// =============================================================================
+bool tournerSurPlace(float angleCible) {
+  float erreur = angleCible - capGlobal;
+  // Normalisation dans [-180°, +180°]
+  while (erreur >  180) erreur -= 360;
+  while (erreur < -180) erreur += 360;
+
+  if (abs(erreur) < 1.5) {
+    piloterMoteurs(0, 0, true, true); // on est arrivé → stop
+    return true;
+  }
+
+  // Puissance proportionnelle à l'erreur, bornée entre PWR_MIN et 210
+  int pwr = constrain((int)(abs(erreur) * Kp_rot) + PWR_MIN, PWR_MIN, 210);
+
+  // erreur > 0 → tourner à gauche (droit en avant, gauche en arrière)
+  // erreur < 0 → tourner à droite (gauche en avant, droit en arrière)
+  if (erreur > 0) piloterMoteurs(pwr, pwr, false, true);
+  else            piloterMoteurs(pwr, pwr, true,  false);
+
+  return false;
+}
+
+// =============================================================================
+// HELPER : transition non bloquante entre deux étapes (correction 3)
+//
+// Remplace les delay(300) du code original.
+// À appeler CHAQUE TOUR DE BOUCLE quand la condition de fin d'étape est remplie.
+// Retourne true uniquement quand DELAI_TRANSITION_MS ms se sont écoulées.
+// Pendant toute la durée : odométrie, serveur web et interruptions continuent.
+// =============================================================================
+bool transitionPrete() {
+  if (!enTransition) {
+    // Premier appel : démarrage du timer + arrêt moteurs + reset terme dérivé
+    enTransition  = true;
+    tTransition   = millis();
+    piloterMoteurs(0, 0, true, true);
+    erreurLatPrev = 0; // important : évite un "kick" dérivé au début de l'étape suivante
+    return false;
+  }
+  // Appels suivants : on attend passivement
+  if (millis() - tTransition >= DELAI_TRANSITION_MS) {
+    enTransition = false; // reset pour la prochaine transition
+    return true;
+  }
+  return false; // pas encore
+}
+
+// =============================================================================
+// SÉQUENCE ESCALIER — Machine à états non bloquante
+//
+// Équivalent exact de escalier() du code Julien, adapté en cm :
+//   Julien mm     →  ici cm
+//   (0,0)→(150,0)       : étapes 0    avancer en X, Y=0   (15 cm)
+//   (150,0)→(150,200)   : étapes 1+2  tourner 90°, monter en Y (20 cm)
+//   (150,200)→(350,200) : étapes 3+4  tourner 0°, avancer en X (20 cm)
+//
+// La différence clé avec Julien : au lieu d'appeler vasla() qui est bloquante,
+// on revient dans loop() à chaque itération → le serveur et l'odométrie tournent.
+// =============================================================================
+void gererSequenceEscalier() {
+  if (!modeAuto) return;
+
+  switch (etapeSeq) {
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 0 : premier segment horizontal (0,0) → (15cm, 0)
+    // On avance selon X en maintenant le stylo sur la ligne Y=0.
+    // -------------------------------------------------------------------------
+    case 0: {
+      // axeX=true → erreur latérale calculée sur Y (on veut Y=0)
+      suivreLigne(0.0, capInitial, true);
+
+      if (x_s_f >= 15.0) {       // stylo arrivé à X=15cm ?
+        if (transitionPrete()) { // pause non bloquante de 300ms
+          etapeSeq = 1;
+        }
+      }
+      break;
+    }
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 1 : rotation 90° vers la gauche (cap initial + 90°)
+    // Le robot pivote sur place pour s'orienter vers Y.
+    // -------------------------------------------------------------------------
+    case 1: {
+      if (tournerSurPlace(capInitial + 90.0)) { // rotation atteinte ?
+        if (transitionPrete()) {
+          etapeSeq = 2;
+        }
+      }
+      break;
+    }
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 2 : segment vertical (15cm, 0) → (15cm, 20cm)
+    // On avance selon Y en maintenant le stylo sur la ligne X=15cm.
+    // -------------------------------------------------------------------------
+    case 2: {
+      // axeX=false → erreur latérale calculée sur X (on veut X=15)
+      suivreLigne(15.0, capInitial + 90.0, false);
+
+      if (y_s_f >= 20.0) {       // stylo arrivé à Y=20cm ?
+        if (transitionPrete()) {
+          etapeSeq = 3;
+        }
+      }
+      break;
+    }
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 3 : rotation retour au cap initial (0°)
+    // Le robot pivote sur place pour se ré-orienter vers X.
+    // -------------------------------------------------------------------------
+    case 3: {
+      if (tournerSurPlace(capInitial)) { // cap initial atteint ?
+        if (transitionPrete()) {
+          etapeSeq = 4;
+        }
+      }
+      break;
+    }
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 4 : deuxième segment horizontal (15cm, 20cm) → (35cm, 20cm)
+    // On avance selon X en maintenant le stylo sur la ligne Y=20cm.
+    // -------------------------------------------------------------------------
+    case 4: {
+      // axeX=true → erreur latérale calculée sur Y (on veut Y=20)
+      suivreLigne(20.0, capInitial, true);
+
+      if (x_s_f >= 35.0) {       // stylo arrivé à X=35cm ?
+        if (transitionPrete()) {
+          etapeSeq = 5;
+        }
+      }
+      break;
+    }
+
+    // -------------------------------------------------------------------------
+    // ÉTAPE 5 : fin de séquence — arrêt complet
+    // -------------------------------------------------------------------------
+    case 5: {
+      piloterMoteurs(0, 0, true, true);
+      modeAuto = false;
+      commandeEnCours = "stop";
+      Serial.println("Séquence escalier terminée !");
+      break;
+    }
+  }
+}
+
+// =============================================================================
+// PAGE WEB — Interface de contrôle
+// Affiche position stylo, cap, étape en cours (mise à jour toutes les 200ms)
+// =============================================================================
+void handleRoot() {
+  String html = "<html><head><meta charset='UTF-8'>"
+                "<meta name='viewport' content='width=device-width,initial-scale=1'><style>";
+  html += "body{background:#111;color:#fff;text-align:center;font-family:sans-serif;}";
+  html += ".btn{padding:20px;margin:5px;width:90px;font-size:1.2rem;border-radius:10px;border:none;background:#333;color:white;}";
+  html += ".spec{width:290px;background:#058;} .stop{background:#811;width:290px;}";
+  html += ".data{background:#222;padding:15px;margin:20px;border-radius:10px;"
+          "display:inline-block;text-align:left;font-family:monospace;}";
+  html += "</style></head><body><h1>DRAW GOAT v2</h1>";
+  html += "<div><button class='btn' onmousedown='s(\"avancer\")' onmouseup='s(\"stop\")'>⬆</button></div>";
+  html += "<div>"
+          "<button class='btn' onmousedown='s(\"rotation_gauche\")' onmouseup='s(\"stop\")'>↺</button>"
+          "<button class='btn' onmousedown='s(\"rotation_droite\")' onmouseup='s(\"stop\")'>↻</button>"
+          "</div>";
+  html += "<div><button class='btn stop' onclick='s(\"stop\")'>STOP</button></div>";
+  html += "<div><button class='btn spec' onclick='s(\"sequence1\")'>🚀 LANCER SÉQUENCE ESCALIER</button></div>";
+  html += "<div><button class='btn spec' style='background:#444' onclick='fetch(\"/reset\")'>🎯 RESET REPÈRE</button></div>";
+  // Affichage temps réel : position en mm (×10 depuis cm), cap, étape
+  html += "<div class='data'>"
+          "X Stylo : <span id='x'>0</span> mm<br>"
+          "Y Stylo : <span id='y'>0</span> mm<br>"
+          "Cap     : <span id='c'>0</span>°<br>"
+          "Étape   : <span id='e'>0</span>/5"
+          "</div>";
+  html += "<script>"
+          "function s(a){fetch('/cmd?a='+a);}"
+          "setInterval(async()=>{"
+          "  const r=await fetch('/pos'); const d=await r.json();"
+          "  document.getElementById('x').innerText=(d.x*10).toFixed(0);"
+          "  document.getElementById('y').innerText=(d.y*10).toFixed(0);"
+          "  document.getElementById('c').innerText=d.c.toFixed(1);"
+          "  document.getElementById('e').innerText=d.e;"
+          "},200);"
+          "</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // --- Broches moteurs ---
+  pinMode(IN_1_D, OUTPUT); pinMode(IN_2_D, OUTPUT);
+  pinMode(IN_1_G, OUTPUT); pinMode(IN_2_G, OUTPUT);
+
+  // --- PWM moteurs via LEDC (ESP32) ---
+  ledcSetup(0, 5000, 8); ledcAttachPin(EN_D, 0); // canal 0 → moteur droit
+  ledcSetup(1, 5000, 8); ledcAttachPin(EN_G, 1); // canal 1 → moteur gauche
+
+  // --- Encodeurs : 4 interruptions CHANGE pour décodage quadrature ×4 ---
+  // CORRECTION 1 : on passe de 2 interruptions RISING à 4 interruptions CHANGE
+  pinMode(ENC_G_CH_A, INPUT);
+  pinMode(ENC_G_CH_B, INPUT);
+  pinMode(ENC_D_CH_A, INPUT);
+  pinMode(ENC_D_CH_B, INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche_A, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_B), ISR_Gauche_B, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit_A,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_B), ISR_Droit_B,  CHANGE);
+
+  // --- WiFi en mode point d'accès ---
+  WiFi.softAP("Draw_GOAT_V2", "12345678");
+  Serial.print("IP : ");
+  Serial.println(WiFi.softAPIP());
+
+  // --- Routes HTTP ---
+  server.on("/", handleRoot);
+
+  server.on("/cmd", []() {
+    String a = server.arg("a");
+    if (a == "sequence1") {
+      // Lancement séquence : reset complet des variables d'état
+      modeAuto      = true;
+      etapeSeq      = 0;
+      enTransition  = false;
+      erreurLatPrev = 0;
+      Serial.println("Séquence escalier lancée.");
+    } else {
+      modeAuto        = false;
+      commandeEnCours = a;
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/pos", []() {
+    // JSON : position stylo (cm), cap (degrés), étape courante
+    String j = "{\"x\":" + String(x_s_f, 3)
+             + ",\"y\":" + String(y_s_f, 3)
+             + ",\"c\":" + String(capGlobal, 2)
+             + ",\"e\":" + String(etapeSeq)
+             + "}";
+    server.send(200, "application/json", j);
+  });
+
+  server.on("/reset", []() {
+    // Remet à zéro le repère : le cap actuel devient 0°, stylo à l'origine
+    Centre_Robot_X = -DISTANCE_STYLO_CM;
+    Centre_Robot_Y = 0.0;
+    capInitial     = capGlobal; // le cap courant devient la référence
+    x_s_f = 0.0; y_s_f = 0.0;
+    pasDroitPrev = 0; pasGauchePrev = 0;
+    noInterrupts(); pasDroit = 0; pasGauche = 0; interrupts();
+    Serial.println("Repère remis à zéro.");
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.begin();
+
+  // --- IMU (conservé pour diagnostic série) ---
+  Wire.begin(21, 22);
+  myIMU.begin();
+
+  tDerniereOdo = millis();
+  Serial.println("Setup complet.");
+}
+
+// =============================================================================
+// LOOP — Boucle principale (entièrement non bloquante)
+//
+// Ordre d'appel intentionnel :
+//   1. handleClient() — répondre aux requêtes HTTP sans bloquer
+//   2. mettreAJourOdometrie() — position à jour avant de décider
+//   3. gererSequenceEscalier() OU commandes manuelles
+// =============================================================================
+void loop() {
+  server.handleClient();  // gestion des requêtes web (non bloquant)
+  mettreAJourOdometrie(); // odométrie toujours fraîche avant la décision moteur
+
+  if (modeAuto) {
+    gererSequenceEscalier(); // machine à états escalier (non bloquante)
+  } else {
+    // Commandes manuelles depuis l'interface web
+    if      (commandeEnCours == "avancer")         piloterMoteurs(200, 200, true,  true);
+    else if (commandeEnCours == "rotation_gauche") piloterMoteurs(180, 180, false, true);
+    else if (commandeEnCours == "rotation_droite") piloterMoteurs(180, 180, true,  false);
+    else if (commandeEnCours == "stop")            piloterMoteurs(0,   0,   true,  true);
+  }
+}
