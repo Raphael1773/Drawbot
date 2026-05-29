@@ -94,13 +94,13 @@ float capGyroRad = 0.0;
 float gyroBiasZ  = 0.0;
 const float GYRO_SENS_MDPS_LSB = 8.75f;   // doit correspondre a gyroRange=245
 const bool  INVERSER_GYRO   = false;      // si la rotation est comptee a l'envers
-float       GYRO_SCALE_CORR = 1.00f;      // calibration fine (test 360 deg)
+float       GYRO_SCALE_CORR = 0.75f;      // calibration fine (test 360 deg)
 const float GYRO_DEADBAND_DPS = 0.05f;     // anti-derive au repos
 const float GYRO_MAX_DPS      = 800.0f;   // rejet des pics aberrants
 uint32_t tDernierGyro = 0;
 
 // Echange des axes X<->Y (uniquement aux frontieres : affichage / cibles)
-const bool ECHANGER_AFFICHAGE = true;
+const bool ECHANGER_AFFICHAGE = false;
 const bool ECHANGER_CIBLES    = false;
 
 const int INTERVALLE_VITESSE_MS = 200;
@@ -177,8 +177,8 @@ int correctionDynamique = 0;
 //  Cap = GYRO integre (capGyroRad). Distance = encodeurs voie A.
 // =====================================================================
 const int   NB_COINS = 4;
-const float COIN_X_CM[NB_COINS] = { 0.0, 15.0, 15.0, 35.0 };
-const float COIN_Y_CM[NB_COINS] = { 0.0,  0.0, 20.0, 20.0 };
+const float COIN_X_CM[NB_COINS] = { 0.0, 20.0, 20.0, 60.0 };
+const float COIN_Y_CM[NB_COINS] = { 0.0,  0.0, 10.0, 10.0 };
 
 const float PAS_WP_CM = 0.5;          // points tous les 5 mm
 
@@ -187,7 +187,7 @@ const float ARRIVE_CM       = 1.0;    // valide un point quand le stylo passe a 
 const float ARRIVE_FINAL_CM = 0.6;    // tolerance sur le tout dernier point
 const uint32_t TIMEOUT_SEQ_MS = 25000;// securite globale
 
-const float KP_A    = 120.0;   // correction d'angle (rad -> pwm)
+const float KP_A    = 80.0;   // correction d'angle (rad -> pwm)
 const float CA_MAX  = 150.0;   // bride la correction d'angle
 const float VCRUISE = 150.0;   // vitesse d'avance constante (monter = + de pousse)
 const float VMAX_SEQ = 220.0;  // borne PWM par moteur
@@ -366,45 +366,38 @@ void arreterSequence() {
 void gererSequenceEscalier() {
   if (!sequenceActive) return;
 
-  digitalWrite(LEDU2, HIGH);
-
   if (millis() - tDebutSeq > TIMEOUT_SEQ_MS) { arreterSequence(); return; }
 
-  // 1) On garde la validation par le STYLO (pour la précision du tracé)
-  while (wpIndex < wpCount - 1) {
-    float d0 = hypot(wpX[wpIndex]     - x_stylo, wpY[wpIndex]     - y_stylo);
-    float d1 = hypot(wpX[wpIndex + 1] - x_stylo, wpY[wpIndex + 1] - y_stylo);
-    if (d0 < ARRIVE_CM || d1 < d0) wpIndex++;
-    else break;
-  }
+  // 1. Validation de la progression par le STYLO
+  float distAuPoint = hypot(wpX[wpIndex] - x_stylo, wpY[wpIndex] - y_stylo);
   
-  if (wpIndex >= wpCount - 1) {
-    float dFin = hypot(wpX[wpCount - 1] - x_stylo, wpY[wpCount - 1] - y_stylo);
-    if (dFin < ARRIVE_FINAL_CM) { arreterSequence(); return; }
+  // Si on est à moins de 1cm (10mm) du point, on passe au suivant
+  if (distAuPoint < ARRIVE_CM) {
+    if (wpIndex < wpCount - 1) wpIndex++;
+    else { arreterSequence(); return; }
   }
 
   if (millis() - tDerniereSeqCorr < 10) return;
   tDerniereSeqCorr = millis();
 
-  int la = wpIndex + LOOKAHEAD_PTS;
+  // 2. Visée depuis le CENTRE (pour éviter le balancement de 12.7cm)
+  int la = wpIndex + 8; // Lookahead de 4cm pour anticiper le virage
   if (la > wpCount - 1) la = wpCount - 1;
 
-  // --- CORRECTION MAJEURE ICI ---
-  // On calcule l'angle par rapport au CENTRE du robot pour la stabilité
   float dx = wpX[la] - Centre_Robot_X;
   float dy = wpY[la] - Centre_Robot_Y;
   
   float consigneAngle = atan2(dy, dx);
   float errAngle = normRad(consigneAngle - capGyroRad);
 
+  // 3. Correction d'angle
   float corrAngle = constrain(KP_A * errAngle, -CA_MAX, CA_MAX);
-  if (INVERSER_SENS_ROTATION) corrAngle = -corrAngle;
+  
+  // Ralentissement en virage pour plus de précision
+  float vVoulue = (abs(errAngle) > 0.15) ? VCRUISE * 0.8 : VCRUISE;
 
-  float vG = constrain(VCRUISE - corrAngle, -VMAX_SEQ, VMAX_SEQ);
-  float vD = constrain(VCRUISE + corrAngle, -VMAX_SEQ, VMAX_SEQ);
-
-  moteurGauche(vG);
-  moteurDroite(vD);
+  moteurGauche(constrain(vVoulue - corrAngle, -VMAX_SEQ, VMAX_SEQ));
+  moteurDroite(constrain(vVoulue + corrAngle, -VMAX_SEQ, VMAX_SEQ));
 }
 
 void corrigerPD() {
