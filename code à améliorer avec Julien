@@ -27,10 +27,6 @@ volatile long pasGauche = 0;
 volatile long ticksOdoDroit  = 0;
 volatile long ticksOdoGauche = 0;
 
-// pasDroit/pasGauche : compteurs NON signes (toujours +) pour le PID.
-// ticksOdoDroit/Gauche : compteurs SIGNES (sens lu sur la voie B) pour l'odometrie.
-// NB : si une roue compte a l'envers (la position part dans le mauvais sens
-// quand le robot avance tout droit), inverser le --/++ de CETTE roue uniquement.
 void IRAM_ATTR ISR_Droit() {
   pasDroit++;
   if (digitalRead(ENC_D_CH_B)) ticksOdoDroit--;
@@ -61,7 +57,7 @@ const int resolution  = 8;
 const int canalDroit  = 0;
 const int canalGauche = 1;
 
-// Puissances nominales cibles
+// Puissances nominales cibles (commandes MANUELLES)
 const int PWR_DROIT_AV  = 200;
 const int PWR_GAUCHE_AV = 208;
 const int PWR_DROIT_AR  = 194;
@@ -69,7 +65,6 @@ const int PWR_GAUCHE_AR = 200;
 const int PWR_VIRAGE    = 210;
 const int PWR_VIR_FAIBLE = 135;
 
-// Ratio pour les virages mobiles (135 / 200)
 const float RATIO_VIRAGE = (float)PWR_VIR_FAIBLE / 200.0;
 
 const float TICKS_PAR_TOUR = 1050.0;
@@ -78,7 +73,7 @@ const float CIRCONF_CM     = PI * DIAM_ROUE_CM;
 const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR;
 
 // CONFIGURATION DU REPERE CARTESIEN
-const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;
+const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;   // cm  (= 127 mm, deport du stylo)
 float Centre_Robot_X = -12.70;
 float Centre_Robot_Y = 0.0;
 float capGlobal = 0.0;
@@ -86,18 +81,11 @@ float capGlobalPrev = 0.0;
 float x_stylo = 0.0;
 float y_stylo = 0.0;
 
-const bool INVERSER_CAP   = false;  // si capGlobal augmente dans le mauvais sens
-const bool INVERSER_GYRO  = false;  // si le gyro Z est oppose au magneto
+const bool INVERSER_CAP   = false;
+const bool INVERSER_GYRO  = false;
 float capInitialAuReset = 0.0;
 
-// ---------------------------------------------------------------------
-//  ECHANGE DES AXES X <-> Y
-//  On NE TOUCHE PAS au calcul interne (cos/sin) : l'offset stylo au reset
-//  et le sens de rotation de l'autopilote y sont cales. On echange les axes
-//  uniquement aux frontieres :
-//   - ECHANGER_AFFICHAGE : permute X/Y dans le JSON envoye a la page HTML.
-//   - ECHANGER_CIBLES    : permute X/Y des points de la sequence escalier
-//                          (=> reflechit le dessin physiquement).
+// Echange des axes X<->Y (uniquement aux frontieres : affichage / cibles)
 const bool ECHANGER_AFFICHAGE = true;
 const bool ECHANGER_CIBLES    = false;
 
@@ -118,8 +106,8 @@ uint32_t tDernierKalman = 0;
 
 struct Kalman1D {
   float Q_angle = 0.001f;
-  float Q_bias  = 0.003f;
-  float R_measure = 0.02f;   // baisser vers 0.02 si le cap jitter trop (+ confiance magneto)
+  float Q_bias  = 0.002f;
+  float R_measure = 0.02f;
   float angle = 0.0f;
   float bias  = 0.0f;
   float P[2][2] = {{0, 0}, {0, 0}};
@@ -159,41 +147,81 @@ const float CALIB_Y_OFFSET =   654.0;
 const float CALIB_X_SCALE  =  1857.0;
 const float CALIB_Y_SCALE  =  1922.0;
 
-// Sensibilite gyro : DOIT correspondre a la plage configuree dans setup().
-// 4.375(+-125) / 8.75(+-245) / 17.5(+-500) / 70(+-2000)  en mdps/LSB
 const float GYRO_SENS_MDPS_LSB = 8.75f;
 
-// Configuration PID d'origine
+// PID des commandes MANUELLES (inchange)
 uint32_t tDerniereCorr = 0;
 const float Kp = 0.8;
 const float Kd = 0.3;
-
 const float Kp_rotation = 0.3;
 const float Kd_rotation = 0.1;
-
 long ecartPrecedent  = 0;
 int correctionDynamique = 0;
 
 // =====================================================================
-//  SEQUENCE AUTONOME "ESCALIER"
-//      (0,0) -> (150,0) -> (150,200) -> (350,200)   (coordonnees en mm)
-//  Cibles a atteindre depuis (0,0) : (150,0) puis (150,200) puis (350,200).
+//  SEQUENCE AUTONOME "ESCALIER" -- STRATEGIE DE JULIEN
+//  Coins (mm) : (0,0) -> (150,0) -> (150,200) -> (350,200)
+//
+//  Pilotage = "pursuit" continu identique a calculpidavecposstylo() :
+//    * visee depuis le CENTRE du robot (point de pivot), pas depuis le stylo
+//    * consigne_distance = dist(centre, cible) - DISTANCE_MI_ENTRAXE_STYLO
+//    * consigne_angle    = atan2(cible - centre)
+//    * vitesseG = corrDist - corrAngle ;  vitesseD = corrDist + corrAngle
+//    * si l'angle est trop grand on tourne d'abord (corrDist = 0)
+//  Chaque segment est DENSIFIE en petits points (comme trajectoirefaituntrait)
+//  pour que le stylo reste colle a la droite. Settle aux 3 coins.
 // =====================================================================
 
-const int   NB_POINTS_ESCALIER = 3;
-const float CIBLE_X_MM[NB_POINTS_ESCALIER] = { 150.0, 150.0, 350.0 };
-const float CIBLE_Y_MM[NB_POINTS_ESCALIER] = {   0.0, 200.0, 200.0 };
+// --- Coins de la figure, en cm (les 4 sommets, depart inclus) ---
+const int   NB_COINS = 4;
+const float COIN_X_CM[NB_COINS] = { 0.0, 15.0, 15.0, 35.0 };
+const float COIN_Y_CM[NB_COINS] = { 0.0,  0.0, 20.0, 20.0 };
 
-const float SEUIL_DISTANCE_CM   = 0.7;    // point atteint sous 7 mm
-const float SEUIL_ANGLE_ENTREE  = 0.10;   // rad (~6 deg)
-const float SEUIL_ANGLE_SORTIE  = 0.30;   // rad (~17 deg)
+// --- Densification ---
+const float PAS_WP_CM = 1.5;        // espacement des points le long d'un segment
 
-const bool  INVERSER_SENS_ROTATION = false;
+// --- Seuils d'arrivee (sur la position du STYLO) ---
+const float SEUIL_PT_INTER_CM = 1.2;  // point intermediaire : on enchaine (lookahead)
+const float SEUIL_PT_COIN_CM  = 0.9;  // coin : precision + settle
+const uint32_t SETTLE_COIN_MS = 200;  // immobilisation au coin
+const uint32_t TIMEOUT_WP_MS  = 6000; // securite : abandon si un point n'est pas atteint
 
-enum PhaseSequence { SEQ_INACTIVE, SEQ_ROTATION, SEQ_AVANCE };
-PhaseSequence phaseSequence = SEQ_INACTIVE;
-bool  sequenceActive = false;
-int   indexPointEscalier = 0;
+// --- Gains du pursuit (sortie en unites PWM) ---
+const float KP_A = 130.0;   // angle (rad -> pwm)
+const float KD_A = 25.0;
+const float KP_D = 28.0;    // distance (cm -> pwm)
+const float KD_D = 8.0;
+const float MAX_ANGLE_DIFF = 0.35;  // rad (~20 deg) : au-dela on tourne sur place d'abord
+
+// --- Bornes / anti-zone-morte moteurs ---
+// NB : a cause du deport stylo (12,7 cm) + de la densification (cible a ~1,5 cm),
+// errDist reste minuscule => corrDist est presque toujours ramene au plancher.
+// C'est donc VMIN_AV_SEQ qui fixe la vitesse de croisiere de la sequence.
+const float VMAX_SEQ    = 240.0;
+const float VMIN_AV_SEQ = 150.0;   // vitesse de croisiere en avance (monter pour + de pousse)
+const float VMIN_TR_SEQ = 130.0;   // pour vaincre la zone morte en rotation
+
+// Si le robot tourne a l'envers pendant le suivi (convention de cap opposee),
+// passer ce flag a true : il inverse simplement le signe de la correction d'angle.
+const bool INVERSER_SENS_ROTATION = false;
+
+// Liste des waypoints generee au lancement
+const int   MAX_WP = 120;
+float wpX[MAX_WP];
+float wpY[MAX_WP];
+bool  wpCoin[MAX_WP];      // true si ce waypoint est un sommet (settle + precision)
+int   wpCount = 0;
+
+bool     sequenceActive = false;
+int      wpIndex = 0;
+uint32_t tArriveeWp = 0;   // pour timeout
+uint32_t tSettle = 0;      // chrono d'immobilisation au coin
+bool     enSettle = false;
+
+// memoire pour les termes derives du pursuit
+float errAnglePrev = 0.0;
+float errDistPrev  = 0.0;
+uint32_t tDerniereSeqCorr = 0;
 
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
@@ -235,9 +263,17 @@ void executerFiltreKalman() {
   if (dt < 0.005f) return;
   tDernierKalman = maintenant;
 
-  float gyroCorrige = myIMU.readRawGyroZ() - gyroBiasZ;
-  float vitesseAngulaireZ = gyroCorrige * GYRO_SENS_MDPS_LSB / 1000.0f;
-  if (INVERSER_GYRO) vitesseAngulaireZ = -vitesseAngulaireZ;
+  float vitesseAngulaireZ = 0.0f;
+  bool mouvementPhysique = (fabs(vitesseDcms) > 0.1f || fabs(vitesseGcms) > 0.1f);
+
+  if (commandeEnCours != "stop" || sequenceActive || mouvementPhysique) {
+    float gyroCorrige = myIMU.readRawGyroZ() - gyroBiasZ;
+    vitesseAngulaireZ = gyroCorrige * GYRO_SENS_MDPS_LSB / 1000.0f;
+    if (INVERSER_GYRO) vitesseAngulaireZ = -vitesseAngulaireZ;
+  } else {
+    vitesseAngulaireZ = 0.0f;
+  }
+
   capGlobal = fKalman.update(obtenirCapMagnetometre(), vitesseAngulaireZ, dt);
 }
 
@@ -247,10 +283,17 @@ void reinitialiserRepereCartesien() {
   ticksOdoDroit = 0; ticksOdoGauche = 0;
   interrupts();
 
-  pasDroitPrev = 0; pasGauchePrev = 0;
-  pasDroitOdoPrev = 0; pasGaucheOdoPrev = 0;
+  float capActuelBrut = obtenirCapMagnetometre();
+  fKalman.angle = capActuelBrut;
+  fKalman.bias = 0.0f;
+  capGlobal = capActuelBrut;
+  capInitialAuReset = capActuelBrut;
+  capGlobalPrev = capGlobal;
 
-  capInitialAuReset = capGlobal;
+  pasDroitPrev = 0;
+  pasGauchePrev = 0;
+  pasDroitOdoPrev = 0;
+  pasGaucheOdoPrev = 0;
 
   Centre_Robot_X = -DISTANCE_MI_ENTRAXE_STYLO;
   Centre_Robot_Y = 0.0;
@@ -269,67 +312,146 @@ void definirCommande(const String& c) {
   commandeEnCours = c;
 }
 
+// ---- Pilotage bas niveau differentiel (comme moteurgauche/moteurdroite de Julien)
+//      Respecte la polarite des broches utilisee dans appliquerCommande().
+void moteurDroite(float v) {
+  if (v >= 0) { digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); }   // avant
+  else        { digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);  }   // arriere
+  ledcWrite(canalDroit, constrain((int)fabs(v), 0, 255));
+}
+void moteurGauche(float v) {
+  if (v >= 0) { digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);  }   // avant
+  else        { digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); }   // arriere
+  ledcWrite(canalGauche, constrain((int)fabs(v), 0, 255));
+}
+void arreterMoteurs() {
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
+
+float normRad(float a) {
+  while (a >  PI) a -= 2 * PI;
+  while (a < -PI) a += 2 * PI;
+  return a;
+}
+
+// Construit la liste des waypoints en densifiant chaque segment entre coins
+// (equivalent de l'enchainement des trajectoirefaituntrait de Julien).
+void construireWaypoints() {
+  wpCount = 0;
+  for (int s = 0; s < NB_COINS - 1; s++) {
+    float ax = COIN_X_CM[s],     ay = COIN_Y_CM[s];
+    float bx = COIN_X_CM[s + 1], by = COIN_Y_CM[s + 1];
+    if (ECHANGER_CIBLES) { float t; t = ax; ax = ay; ay = t; t = bx; bx = by; by = t; }
+
+    float seg = sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+    int n = (int)(seg / PAS_WP_CM);
+    if (n < 1) n = 1;
+    // points i=1..n : on n'inclut pas le coin de depart (deja atteint)
+    for (int i = 1; i <= n && wpCount < MAX_WP; i++) {
+      float t = (float)i / (float)n;
+      wpX[wpCount] = ax + (bx - ax) * t;
+      wpY[wpCount] = ay + (by - ay) * t;
+      wpCoin[wpCount] = (i == n);   // le dernier point du segment est un sommet
+      wpCount++;
+    }
+  }
+}
+
 void demarrerSequenceEscalier() {
   reinitialiserRepereCartesien();
-  indexPointEscalier = 0;
-  phaseSequence = SEQ_ROTATION;
-  sequenceActive = true;
+  construireWaypoints();
+  wpIndex = 0;
+  enSettle = false;
+  errAnglePrev = 0.0; errDistPrev = 0.0;
+  tArriveeWp = millis();
+  tDerniereSeqCorr = millis();
+  sequenceActive = (wpCount > 0);
 }
 
 void arreterSequence() {
   sequenceActive = false;
-  phaseSequence = SEQ_INACTIVE;
+  enSettle = false;
+  arreterMoteurs();
   definirCommande("stop");
 }
 
+// Autopilote non bloquant : appele a chaque loop() tant que sequenceActive.
+// Pilote DIRECTEMENT les moteurs (n'utilise pas appliquerCommande/corrigerPD).
 void gererSequenceEscalier() {
   if (!sequenceActive) return;
+  if (wpIndex >= wpCount) { arreterSequence(); return; }
 
-  // Cible courante en cm. Echange X/Y optionnel (dessin physique transpose).
-  float cibleX, cibleY;
-  if (ECHANGER_CIBLES) {
-    cibleX = CIBLE_Y_MM[indexPointEscalier] / 10.0;
-    cibleY = CIBLE_X_MM[indexPointEscalier] / 10.0;
-  } else {
-    cibleX = CIBLE_X_MM[indexPointEscalier] / 10.0;
-    cibleY = CIBLE_Y_MM[indexPointEscalier] / 10.0;
-  }
+  digitalWrite(LEDU2, HIGH);
 
-  float dx = cibleX - x_stylo;
-  float dy = cibleY - y_stylo;
-  float distance = sqrt(dx * dx + dy * dy);
+  float cibleX = wpX[wpIndex];
+  float cibleY = wpY[wpIndex];
 
-  if (distance < SEUIL_DISTANCE_CM) {
-    indexPointEscalier++;
-    if (indexPointEscalier >= NB_POINTS_ESCALIER) {
-      arreterSequence();
-      return;
+  // Distance STYLO -> cible (sert uniquement au test d'arrivee, comme vasla)
+  float dpx = cibleX - x_stylo;
+  float dpy = cibleY - y_stylo;
+  float distStylo = sqrt(dpx * dpx + dpy * dpy);
+
+  float seuil = wpCoin[wpIndex] ? SEUIL_PT_COIN_CM : SEUIL_PT_INTER_CM;
+
+  // --- Gestion arrivee + settle aux coins ---
+  if (distStylo < seuil) {
+    if (wpCoin[wpIndex]) {
+      // immobilisation breve au sommet pour un coin net
+      arreterMoteurs();
+      if (!enSettle) { enSettle = true; tSettle = millis(); }
+      if (millis() - tSettle < SETTLE_COIN_MS) return;  // on reste a l'arret
     }
-    phaseSequence = SEQ_ROTATION;
-    definirCommande("stop");
+    // point valide -> passage au suivant
+    wpIndex++;
+    enSettle = false;
+    errAnglePrev = 0.0; errDistPrev = 0.0;
+    tArriveeWp = millis();
+    if (wpIndex >= wpCount) { arreterSequence(); return; }
     return;
   }
 
-  float capVoulu  = atan2(dy, dx);
-  float capActuel = (capGlobal - capInitialAuReset) * PI / 180.0;
+  // --- Securite : timeout sur un waypoint ---
+  if (millis() - tArriveeWp > TIMEOUT_WP_MS) { arreterSequence(); return; }
 
-  float erreurAngle = capVoulu - capActuel;
-  while (erreurAngle >  PI) erreurAngle -= 2 * PI;
-  while (erreurAngle < -PI) erreurAngle += 2 * PI;
+  // --- Boucle de controle a ~100 Hz (comme corrigerPD) ---
+  if (millis() - tDerniereSeqCorr < 10) return;
+  tDerniereSeqCorr = millis();
 
-  if (phaseSequence == SEQ_ROTATION) {
-    if (fabs(erreurAngle) < SEUIL_ANGLE_ENTREE) phaseSequence = SEQ_AVANCE;
+  // === PURSUIT REFERENCE AU CENTRE (logique calculpidavecposstylo) ===
+  float dx = cibleX - Centre_Robot_X;
+  float dy = cibleY - Centre_Robot_Y;
+  float distCentre = sqrt(dx * dx + dy * dy);
+
+  float consigneAngle = atan2(dy, dx);
+  float angleRobot    = (capGlobal - capInitialAuReset) * PI / 180.0;
+  float errAngle      = normRad(consigneAngle - angleRobot);
+
+  // consigne_distance = dist(centre,cible) - deport stylo  (= 0 quand le stylo est sur la cible)
+  float errDist = distCentre - DISTANCE_MI_ENTRAXE_STYLO;
+
+  // Si l'angle est trop grand : on tourne d'abord (l'angle fait tout le travail)
+  bool tournerDabord = (fabs(errAngle) > MAX_ANGLE_DIFF);
+
+  float corrAngle = KP_A * errAngle + KD_A * (errAngle - errAnglePrev);
+  float corrDist  = tournerDabord ? 0.0f
+                                  : (KP_D * errDist + KD_D * (errDist - errDistPrev));
+  if (INVERSER_SENS_ROTATION) corrAngle = -corrAngle;
+
+  errAnglePrev = errAngle;
+  errDistPrev  = errDist;
+
+  // Anti zone-morte
+  if (tournerDabord) {
+    if (fabs(corrAngle) < VMIN_TR_SEQ) corrAngle = (corrAngle >= 0 ? VMIN_TR_SEQ : -VMIN_TR_SEQ);
   } else {
-    if (fabs(erreurAngle) > SEUIL_ANGLE_SORTIE) phaseSequence = SEQ_ROTATION;
+    if (corrDist > 0 && corrDist < VMIN_AV_SEQ) corrDist = VMIN_AV_SEQ;
   }
 
-  if (phaseSequence == SEQ_ROTATION) {
-    bool tournerGauche = (erreurAngle > 0.0);
-    if (INVERSER_SENS_ROTATION) tournerGauche = !tournerGauche;
-    definirCommande(tournerGauche ? "rotation_gauche" : "rotation_droite");
-  } else {
-    definirCommande("avancer");
-  }
+  float vG = constrain(corrDist - corrAngle, -VMAX_SEQ, VMAX_SEQ);
+  float vD = constrain(corrDist + corrAngle, -VMAX_SEQ, VMAX_SEQ);
+
+  moteurGauche(vG);
+  moteurDroite(vD);
 }
 
 void corrigerPD() {
@@ -383,32 +505,21 @@ void mettreAJourOdometrie() {
   if (millis() - tDerniereOdo < 10) return;
   tDerniereOdo = millis();
 
-  noInterrupts(); 
-  long actuelsD = ticksOdoDroit; 
-  long actuelsG = ticksOdoGauche; 
-
+  noInterrupts();
+  long actuelsD = ticksOdoDroit;
+  long actuelsG = ticksOdoGauche;
   interrupts();
 
-  long deltaTicksD = actuelsD - pasDroitOdoPrev; 
+  long deltaTicksD = actuelsD - pasDroitOdoPrev;
   long deltaTicksG = actuelsG - pasGaucheOdoPrev;
 
-  pasDroitOdoPrev  = actuelsD; 
+  pasDroitOdoPrev  = actuelsD;
   pasGaucheOdoPrev = actuelsG;
-
-  // ROBOT A L'ARRET : on fige la pose. Sinon le bruit/derive du cap fait
-  // "bouger" le stylo (amplifie par l'offset stylo de 127 mm) alors qu'il
-  // est immobile. On garde les references a jour pour ne pas sauter au depart.
-  if (commandeEnCours == "stop") {
-    capGlobalPrev = capGlobal;
-    return;
-  }
 
   float distD = (float)deltaTicksD * CM_PAR_TICK;
   float distG = (float)deltaTicksG * CM_PAR_TICK;
-  // Signe porte par les ticks SIGNES : en rotation pure distD ~= -distG -> somme ~ 0.
   float deltaDCentre = (distD + distG) / 2.0;
 
-  // Moyenne d'angle sans saut au passage 360 -> 0
   float delta = capGlobal - capGlobalPrev;
   if (delta >  180.0) delta -= 360.0;
   if (delta < -180.0) delta += 360.0;
@@ -418,8 +529,6 @@ void mettreAJourOdometrie() {
   float capVirtuelDeg = angleMoyenDeg - capInitialAuReset;
   float capRad = capVirtuelDeg * PI / 180.0;
 
-  // Calcul interne INCHANGE (ne pas permuter cos/sin ici : l'offset stylo
-  // et le sens de rotation y sont cales). L'echange X/Y se fait a l'affichage.
   Centre_Robot_X += deltaDCentre * cos(capRad);
   Centre_Robot_Y += deltaDCentre * sin(capRad);
 
@@ -510,7 +619,7 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
         document.getElementById('sty-y').textContent = d.sy.toFixed(1);
         const e = document.getElementById('seq-etat');
         const b = document.getElementById('btn-escalier');
-        if (d.seq) { e.textContent = 'EN COURS (cible ' + (d.seqpt + 1) + '/3)'; b.classList.add('running'); }
+        if (d.seq) { e.textContent = 'EN COURS (pt ' + (d.seqpt + 1) + '/' + d.seqn + ')'; b.classList.add('running'); }
         else { e.textContent = 'inactive'; b.classList.remove('running'); }
       } catch(e) {}
     }, 150);
@@ -523,36 +632,31 @@ void handleRoot() { server.send_P(200, "text/html", PAGE_HTML); }
 
 void handleCmd() {
   if (server.hasArg("action")) {
-    sequenceActive = false;
-    phaseSequence = SEQ_INACTIVE;
+    sequenceActive = false;     // tout bouton manuel coupe l'autopilote
+    enSettle = false;
     definirCommande(server.arg("action"));
   }
   server.send(200, "text/plain", "ok");
 }
 
 void handlePositions() {
-  // Echange X/Y a l'affichage : on montre Y a la place de X et inversement.
   float robX, robY, styX, styY;
   if (ECHANGER_AFFICHAGE) {
-    robX = Centre_Robot_Y * 10.0; 
-    robY = Centre_Robot_X * 10.0;
-    styX = y_stylo        * 10.0; 
-    styY = x_stylo        * 10.0;
+    robX = Centre_Robot_Y * 10.0;  robY = Centre_Robot_X * 10.0;
+    styX = y_stylo        * 10.0;  styY = x_stylo        * 10.0;
   } else {
-    robX = Centre_Robot_X * 10.0; robY = Centre_Robot_Y * 10.0;
-    styX = x_stylo        * 10.0; styY = y_stylo        * 10.0;
+    robX = Centre_Robot_X * 10.0;  robY = Centre_Robot_Y * 10.0;
+    styX = x_stylo        * 10.0;  styY = y_stylo        * 10.0;
   }
 
-  char json[200];
+  float capRelatif = capGlobal - capInitialAuReset;
+  if (capRelatif > 180.0)  capRelatif -= 360.0;
+  if (capRelatif < -180.0) capRelatif += 360.0;
 
-  // Remplace capGlobal par le calcul relatif
-float capRelatif = capGlobal - capInitialAuReset;
-if (capRelatif > 180.0) capRelatif -= 360.0;
-if (capRelatif < -180.0) capRelatif += 360.0;
-
-snprintf(json, sizeof(json),
-  "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d}",
-  robX, robY, styX, styY, capRelatif, sequenceActive ? 1 : 0, indexPointEscalier);
+  char json[220];
+  snprintf(json, sizeof(json),
+    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d,\"seqn\":%d}",
+    robX, robY, styX, styY, capRelatif, sequenceActive ? 1 : 0, wpIndex, wpCount);
   server.send(200, "application/json", json);
 }
 
@@ -639,7 +743,7 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(400000);
   initLIS3MDL();
 
-  myIMU.settings.gyroRange      = 245;   // doit correspondre a GYRO_SENS_MDPS_LSB (8.75)
+  myIMU.settings.gyroRange      = 245;
   myIMU.settings.gyroSampleRate = 416;
   myIMU.settings.gyroBandWidth  = 200;
   if (myIMU.begin() == 0) { calibrerGyro(); }
@@ -652,9 +756,15 @@ void setup() {
 void loop() {
   server.handleClient();
   executerFiltreKalman();
-  gererSequenceEscalier();
-  appliquerCommande();
-  corrigerPD();
   calculerVitesse();
   mettreAJourOdometrie();
+
+  if (sequenceActive) {
+    // En sequence : l'autopilote pilote DIRECTEMENT les moteurs.
+    gererSequenceEscalier();
+  } else {
+    // Hors sequence : commandes manuelles habituelles + PID d'origine.
+    appliquerCommande();
+    corrigerPD();
+  }
 }
