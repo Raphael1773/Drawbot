@@ -22,25 +22,19 @@
 #define ENC_D_CH_A 27
 #define ENC_D_CH_B 14
 
+// =====================================================================
+//  ENCODEURS : interruption LEGERE sur la voie A (front montant), comme le
+//  code d'origine. pasDroit/pasGauche = magnitude (1050/tour). Sert au PID
+//  manuel ET a la DISTANCE parcourue de la sequence (le robot n'avance que
+//  vers l'avant pendant l'escalier, donc la magnitude = distance reelle).
+//  On NE deduit PLUS le cap des encodeurs (trop de fronts perdus a vitesse
+//  moteur sur des encodeurs Hall) -> le cap vient du GYROSCOPE.
+// =====================================================================
 volatile long pasDroit  = 0;
 volatile long pasGauche = 0;
-volatile long ticksOdoDroit  = 0;
-volatile long ticksOdoGauche = 0;
 
-// pasDroit/pasGauche : compteurs NON signes (toujours +) pour le PID.
-// ticksOdoDroit/Gauche : compteurs SIGNES (sens lu sur la voie B) pour l'odometrie.
-// NB : si une roue compte a l'envers (la position part dans le mauvais sens
-// quand le robot avance tout droit), inverser le --/++ de CETTE roue uniquement.
-void IRAM_ATTR ISR_Droit() {
-  pasDroit++;
-  if (digitalRead(ENC_D_CH_B)) ticksOdoDroit--;
-  else                         ticksOdoDroit++;
-}
-void IRAM_ATTR ISR_Gauche() {
-  pasGauche++;
-  if (digitalRead(ENC_G_CH_B)) ticksOdoGauche--;
-  else                         ticksOdoGauche++;
-}
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; }
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -61,7 +55,7 @@ const int resolution  = 8;
 const int canalDroit  = 0;
 const int canalGauche = 1;
 
-// Puissances nominales cibles
+// Puissances nominales cibles (commandes MANUELLES)
 const int PWR_DROIT_AV  = 200;
 const int PWR_GAUCHE_AV = 208;
 const int PWR_DROIT_AR  = 194;
@@ -69,7 +63,6 @@ const int PWR_GAUCHE_AR = 200;
 const int PWR_VIRAGE    = 210;
 const int PWR_VIR_FAIBLE = 135;
 
-// Ratio pour les virages mobiles (135 / 200)
 const float RATIO_VIRAGE = (float)PWR_VIR_FAIBLE / 200.0;
 
 const float TICKS_PAR_TOUR = 1050.0;
@@ -78,26 +71,35 @@ const float CIRCONF_CM     = PI * DIAM_ROUE_CM;
 const float CM_PAR_TICK    = CIRCONF_CM / TICKS_PAR_TOUR;
 
 // CONFIGURATION DU REPERE CARTESIEN
-const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;
+const float DISTANCE_MI_ENTRAXE_STYLO = 12.70;   // cm  (= 127 mm, deport du stylo)
 float Centre_Robot_X = -12.70;
 float Centre_Robot_Y = 0.0;
-float capGlobal = 0.0;
-float capGlobalPrev = 0.0;
 float x_stylo = 0.0;
 float y_stylo = 0.0;
 
-const bool INVERSER_CAP   = false;  // si capGlobal augmente dans le mauvais sens
-const bool INVERSER_GYRO  = false;  // si le gyro Z est oppose au magneto
+// ---- cap magneto/Kalman : conserve pour l'affichage hors sequence, NON
+//      utilise pour piloter (le magneto est pollue par les moteurs).
+float capGlobal = 0.0;
+float capGlobalPrev = 0.0;
+const bool INVERSER_CAP   = false;
 float capInitialAuReset = 0.0;
 
-// ---------------------------------------------------------------------
-//  ECHANGE DES AXES X <-> Y
-//  On NE TOUCHE PAS au calcul interne (cos/sin) : l'offset stylo au reset
-//  et le sens de rotation de l'autopilote y sont cales. On echange les axes
-//  uniquement aux frontieres :
-//   - ECHANGER_AFFICHAGE : permute X/Y dans le JSON envoye a la page HTML.
-//   - ECHANGER_CIBLES    : permute X/Y des points de la sequence escalier
-//                          (=> reflechit le dessin physiquement).
+// =====================================================================
+//  CAP GYRO -- c'est LUI qui pilote la sequence et qui sert a la pose.
+//  Integre la vitesse de rotation Z du gyro : capGyroRad += w * dt.
+//  Immunise contre le champ des moteurs (contrairement au magneto) et
+//  contre la perte de fronts d'encodeurs. 0 = oriente vers +X au reset.
+// =====================================================================
+float capGyroRad = 0.0;
+float gyroBiasZ  = 0.0;
+const float GYRO_SENS_MDPS_LSB = 8.75f;   // doit correspondre a gyroRange=245
+const bool  INVERSER_GYRO   = false;      // si la rotation est comptee a l'envers
+float       GYRO_SCALE_CORR = 1.00f;      // calibration fine (test 360 deg)
+const float GYRO_DEADBAND_DPS = 0.8f;     // anti-derive au repos
+const float GYRO_MAX_DPS      = 800.0f;   // rejet des pics aberrants
+uint32_t tDernierGyro = 0;
+
+// Echange des axes X<->Y (uniquement aux frontieres : affichage / cibles)
 const bool ECHANGER_AFFICHAGE = true;
 const bool ECHANGER_CIBLES    = false;
 
@@ -109,17 +111,16 @@ long     pasDroitPrev   = 0;
 long     pasGauchePrev  = 0;
 uint32_t tDerniereVit   = 0;
 
-long     pasDroitOdoPrev  = 0;
-long     pasGaucheOdoPrev = 0;
-uint32_t tDerniereOdo     = 0;
+long     odoPasDprev = 0;
+long     odoPasGprev = 0;
+uint32_t tDerniereOdo = 0;
 
-float gyroBiasZ   = 0.0;
 uint32_t tDernierKalman = 0;
 
 struct Kalman1D {
   float Q_angle = 0.001f;
   float Q_bias  = 0.002f;
-  float R_measure = 0.02f;   // baisser vers 0.02 si le cap jitter trop (+ confiance magneto)
+  float R_measure = 0.02f;
   float angle = 0.0f;
   float bias  = 0.0f;
   float P[2][2] = {{0, 0}, {0, 0}};
@@ -159,41 +160,51 @@ const float CALIB_Y_OFFSET =   654.0;
 const float CALIB_X_SCALE  =  1857.0;
 const float CALIB_Y_SCALE  =  1922.0;
 
-// Sensibilite gyro : DOIT correspondre a la plage configuree dans setup().
-// 4.375(+-125) / 8.75(+-245) / 17.5(+-500) / 70(+-2000)  en mdps/LSB
-const float GYRO_SENS_MDPS_LSB = 8.75f;
-
-// Configuration PID d'origine
+// PID des commandes MANUELLES (inchange)
 uint32_t tDerniereCorr = 0;
 const float Kp = 0.8;
 const float Kd = 0.3;
-
 const float Kp_rotation = 0.3;
 const float Kd_rotation = 0.1;
-
 long ecartPrecedent  = 0;
 int correctionDynamique = 0;
 
 // =====================================================================
 //  SEQUENCE AUTONOME "ESCALIER"
-//      (0,0) -> (150,0) -> (150,200) -> (350,200)   (coordonnees en mm)
-//  Cibles a atteindre depuis (0,0) : (150,0) puis (150,200) puis (350,200).
+//  Coins (mm) : (0,0) -> (150,0) -> (150,200) -> (350,200)
+//  Poursuite referencee STYLO + point d'anticipation (lookahead), avance a
+//  vitesse constante (JAMAIS de pivot sur place -> pas d'arc de cercle).
+//  Cap = GYRO integre (capGyroRad). Distance = encodeurs voie A.
 // =====================================================================
+const int   NB_COINS = 4;
+const float COIN_X_CM[NB_COINS] = { 0.0, 15.0, 15.0, 35.0 };
+const float COIN_Y_CM[NB_COINS] = { 0.0,  0.0, 20.0, 20.0 };
 
-const int   NB_POINTS_ESCALIER = 3;
-const float CIBLE_X_MM[NB_POINTS_ESCALIER] = { 150.0, 150.0, 350.0 };
-const float CIBLE_Y_MM[NB_POINTS_ESCALIER] = {   0.0, 200.0, 200.0 };
+const float PAS_WP_CM = 0.5;          // points tous les 5 mm
 
-const float SEUIL_DISTANCE_CM   = 0.7;    // point atteint sous 7 mm
-const float SEUIL_ANGLE_ENTREE  = 0.10;   // rad (~6 deg)
-const float SEUIL_ANGLE_SORTIE  = 0.30;   // rad (~17 deg)
+const int   LOOKAHEAD_PTS   = 4;      // vise le point idx+4 (~2 cm devant)
+const float ARRIVE_CM       = 1.0;    // valide un point quand le stylo passe a <10 mm
+const float ARRIVE_FINAL_CM = 0.6;    // tolerance sur le tout dernier point
+const uint32_t TIMEOUT_SEQ_MS = 25000;// securite globale
 
-const bool  INVERSER_SENS_ROTATION = false;
+const float KP_A    = 120.0;   // correction d'angle (rad -> pwm)
+const float CA_MAX  = 150.0;   // bride la correction d'angle
+const float VCRUISE = 150.0;   // vitesse d'avance constante (monter = + de pousse)
+const float VMAX_SEQ = 220.0;  // borne PWM par moteur
 
-enum PhaseSequence { SEQ_INACTIVE, SEQ_ROTATION, SEQ_AVANCE };
-PhaseSequence phaseSequence = SEQ_INACTIVE;
-bool  sequenceActive = false;
-int   indexPointEscalier = 0;
+// Si le robot tourne a l'envers pendant le suivi : passer a true.
+const bool INVERSER_SENS_ROTATION = false;
+
+const int   MAX_WP = 130;
+float wpX[MAX_WP];
+float wpY[MAX_WP];
+bool  wpCoin[MAX_WP];
+int   wpCount = 0;
+
+bool     sequenceActive = false;
+int      wpIndex = 0;
+uint32_t tDebutSeq = 0;
+uint32_t tDerniereSeqCorr = 0;
 
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
@@ -212,10 +223,12 @@ void initLIS3MDL() {
   writeReg(LIS3MDL_ADDR, LIS3_CTRL4, 0x0C);
 }
 
+// Estimation du biais gyro (robot IMMOBILE). Appelee au boot ET au lancement
+// de la sequence (le robot est pose et immobile a ce moment-la).
 void calibrerGyro() {
   long somme = 0;
-  for (int i = 0; i < 300; i++) { somme += myIMU.readRawGyroZ(); delay(4); }
-  gyroBiasZ = (float)somme / 300.0;
+  for (int i = 0; i < 200; i++) { somme += myIMU.readRawGyroZ(); delay(3); }
+  gyroBiasZ = (float)somme / 200.0;
 }
 
 float obtenirCapMagnetometre() {
@@ -229,53 +242,52 @@ float obtenirCapMagnetometre() {
   return cap;
 }
 
+// Kalman magneto/gyro : conserve UNIQUEMENT pour l'affichage hors sequence.
+// Desactive pendant la sequence (le magneto pollue serait nuisible + charge I2C).
 void executerFiltreKalman() {
+  if (sequenceActive) return;
   uint32_t maintenant = millis();
   float dt = (maintenant - tDernierKalman) / 1000.0f;
-  if (dt < 0.005f) return;
+  if (dt < 0.02f) return;          // ralenti a ~50 Hz pour ne pas surcharger
   tDernierKalman = maintenant;
 
-  float vitesseAngulaireZ = 0.0f;
-
-  bool mouvementPhysique = (fabs(vitesseDcms) > 0.1f || fabs(vitesseGcms) > 0.1f);
-
-if (commandeEnCours != "stop" || sequenceActive || mouvementPhysique) {
   float gyroCorrige = myIMU.readRawGyroZ() - gyroBiasZ;
-  vitesseAngulaireZ = gyroCorrige * GYRO_SENS_MDPS_LSB / 1000.0f;
-  if (INVERSER_GYRO) vitesseAngulaireZ = -vitesseAngulaireZ;
-}
-else {
-  vitesseAngulaireZ = 0.0f;
+  float w = gyroCorrige * GYRO_SENS_MDPS_LSB / 1000.0f;
+  if (INVERSER_GYRO) w = -w;
+  capGlobal = fKalman.update(obtenirCapMagnetometre(), w, dt);
 }
 
-  capGlobal = fKalman.update(obtenirCapMagnetometre(), vitesseAngulaireZ, dt);
+// Lecture + integration du cap GYRO (avec verifications). dt en secondes.
+void majCapGyro(float dt) {
+  float raw = (float)myIMU.readRawGyroZ() - gyroBiasZ;
+  float dps = raw * GYRO_SENS_MDPS_LSB / 1000.0f;     // deg/s
+  if (fabs(dps) > GYRO_MAX_DPS)      dps = 0.0f;      // rejet pic aberrant
+  if (fabs(dps) < GYRO_DEADBAND_DPS) dps = 0.0f;      // anti-derive au repos
+  dps *= GYRO_SCALE_CORR;
+  if (INVERSER_GYRO) dps = -dps;
+  capGyroRad += dps * (float)PI / 180.0f * dt;
 }
 
 void reinitialiserRepereCartesien() {
   noInterrupts();
   pasDroit = 0; pasGauche = 0;
-  ticksOdoDroit = 0; ticksOdoGauche = 0;
   interrupts();
+
+  capGyroRad = 0.0;                 // cap gyro : 0 = oriente vers +X
 
   float capActuelBrut = obtenirCapMagnetometre();
   fKalman.angle = capActuelBrut;
-  fKalman.bias = 0.0f;  
+  fKalman.bias = 0.0f;
   capGlobal = capActuelBrut;
   capInitialAuReset = capActuelBrut;
   capGlobalPrev = capGlobal;
 
-  pasDroitPrev = 0; 
-  pasGauchePrev = 0;
-  pasDroitOdoPrev = 0;
-   pasGaucheOdoPrev = 0;
+  pasDroitPrev = 0; pasGauchePrev = 0;
+  odoPasDprev = 0;  odoPasGprev = 0;
 
   Centre_Robot_X = -DISTANCE_MI_ENTRAXE_STYLO;
   Centre_Robot_Y = 0.0;
-
-  x_stylo = 0.0;
-  y_stylo = 0.0;
-
-  capGlobalPrev = capGlobal;
+  x_stylo = 0.0; y_stylo = 0.0;
 }
 
 void definirCommande(const String& c) {
@@ -286,67 +298,102 @@ void definirCommande(const String& c) {
   commandeEnCours = c;
 }
 
+void moteurDroite(float v) {
+  if (v >= 0) { digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH); }
+  else        { digitalWrite(IN_1_D, HIGH); digitalWrite(IN_2_D, LOW);  }
+  ledcWrite(canalDroit, constrain((int)fabs(v), 0, 255));
+}
+void moteurGauche(float v) {
+  if (v >= 0) { digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);  }
+  else        { digitalWrite(IN_1_G, LOW);  digitalWrite(IN_2_G, HIGH); }
+  ledcWrite(canalGauche, constrain((int)fabs(v), 0, 255));
+}
+void arreterMoteurs() {
+  ledcWrite(canalDroit, 0); ledcWrite(canalGauche, 0);
+}
+
+float normRad(float a) {
+  while (a >  PI) a -= 2 * PI;
+  while (a < -PI) a += 2 * PI;
+  return a;
+}
+
+void construireWaypoints() {
+  wpCount = 0;
+  for (int s = 0; s < NB_COINS - 1; s++) {
+    float ax = COIN_X_CM[s],     ay = COIN_Y_CM[s];
+    float bx = COIN_X_CM[s + 1], by = COIN_Y_CM[s + 1];
+    if (ECHANGER_CIBLES) { float t; t = ax; ax = ay; ay = t; t = bx; bx = by; by = t; }
+    float seg = sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+    int n = (int)(seg / PAS_WP_CM);
+    if (n < 1) n = 1;
+    for (int i = 1; i <= n && wpCount < MAX_WP; i++) {
+      float t = (float)i / (float)n;
+      wpX[wpCount] = ax + (bx - ax) * t;
+      wpY[wpCount] = ay + (by - ay) * t;
+      wpCoin[wpCount] = (i == n);
+      wpCount++;
+    }
+  }
+}
+
 void demarrerSequenceEscalier() {
+  arreterMoteurs();
+  calibrerGyro();                 // re-estime le biais gyro (robot immobile au lancement)
   reinitialiserRepereCartesien();
-  indexPointEscalier = 0;
-  phaseSequence = SEQ_ROTATION;
-  sequenceActive = true;
+  construireWaypoints();
+  wpIndex = 0;
+  tDebutSeq = millis();
+  tDerniereSeqCorr = millis();
+  tDernierGyro = millis();
+  sequenceActive = (wpCount > 0);
 }
 
 void arreterSequence() {
   sequenceActive = false;
-  phaseSequence = SEQ_INACTIVE;
+  arreterMoteurs();
   definirCommande("stop");
 }
 
+// Poursuite referencee STYLO + lookahead, avance a vitesse constante.
+// Braquage sur le cap GYRO (capGyroRad). On ne pivote JAMAIS sur place.
 void gererSequenceEscalier() {
   if (!sequenceActive) return;
 
-  // Cible courante en cm. Echange X/Y optionnel (dessin physique transpose).
-  float cibleX, cibleY;
-  if (ECHANGER_CIBLES) {
-    cibleX = CIBLE_Y_MM[indexPointEscalier] / 10.0;
-    cibleY = CIBLE_X_MM[indexPointEscalier] / 10.0;
-  } else {
-    cibleX = CIBLE_X_MM[indexPointEscalier] / 10.0;
-    cibleY = CIBLE_Y_MM[indexPointEscalier] / 10.0;
+  digitalWrite(LEDU2, HIGH);
+
+  if (millis() - tDebutSeq > TIMEOUT_SEQ_MS) { arreterSequence(); return; }
+
+  while (wpIndex < wpCount - 1) {
+    float d0 = hypot(wpX[wpIndex]     - x_stylo, wpY[wpIndex]     - y_stylo);
+    float d1 = hypot(wpX[wpIndex + 1] - x_stylo, wpY[wpIndex + 1] - y_stylo);
+    if (d0 < ARRIVE_CM || d1 < d0) wpIndex++;
+    else break;
+  }
+  if (wpIndex >= wpCount - 1) {
+    float dFin = hypot(wpX[wpCount - 1] - x_stylo, wpY[wpCount - 1] - y_stylo);
+    if (dFin < ARRIVE_FINAL_CM) { arreterSequence(); return; }
   }
 
-  float dx = cibleX - x_stylo;
-  float dy = cibleY - y_stylo;
-  float distance = sqrt(dx * dx + dy * dy);
+  if (millis() - tDerniereSeqCorr < 10) return;
+  tDerniereSeqCorr = millis();
 
-  if (distance < SEUIL_DISTANCE_CM) {
-    indexPointEscalier++;
-    if (indexPointEscalier >= NB_POINTS_ESCALIER) {
-      arreterSequence();
-      return;
-    }
-    phaseSequence = SEQ_ROTATION;
-    definirCommande("stop");
-    return;
-  }
+  int la = wpIndex + LOOKAHEAD_PTS;
+  if (la > wpCount - 1) la = wpCount - 1;
 
-  float capVoulu  = atan2(dy, dx);
-  float capActuel = (capGlobal - capInitialAuReset) * PI / 180.0;
+  float dx = wpX[la] - x_stylo;
+  float dy = wpY[la] - y_stylo;
+  float consigneAngle = atan2(dy, dx);
+  float errAngle = normRad(consigneAngle - capGyroRad);   // cap = gyro
 
-  float erreurAngle = capVoulu - capActuel;
-  while (erreurAngle >  PI) erreurAngle -= 2 * PI;
-  while (erreurAngle < -PI) erreurAngle += 2 * PI;
+  float corrAngle = constrain(KP_A * errAngle, -CA_MAX, CA_MAX);
+  if (INVERSER_SENS_ROTATION) corrAngle = -corrAngle;
 
-  if (phaseSequence == SEQ_ROTATION) {
-    if (fabs(erreurAngle) < SEUIL_ANGLE_ENTREE) phaseSequence = SEQ_AVANCE;
-  } else {
-    if (fabs(erreurAngle) > SEUIL_ANGLE_SORTIE) phaseSequence = SEQ_ROTATION;
-  }
+  float vG = constrain(VCRUISE - corrAngle, -VMAX_SEQ, VMAX_SEQ);
+  float vD = constrain(VCRUISE + corrAngle, -VMAX_SEQ, VMAX_SEQ);
 
-  if (phaseSequence == SEQ_ROTATION) {
-    bool tournerGauche = (erreurAngle > 0.0);
-    if (INVERSER_SENS_ROTATION) tournerGauche = !tournerGauche;
-    definirCommande(tournerGauche ? "rotation_gauche" : "rotation_droite");
-  } else {
-    definirCommande("avancer");
-  }
+  moteurGauche(vG);
+  moteurDroite(vD);
 }
 
 void corrigerPD() {
@@ -361,27 +408,15 @@ void corrigerPD() {
   float kd_actuel = Kd;
 
   if (commandeEnCours == "avancer" || commandeEnCours == "reculer") {
-    ecart = tD - tG;
-    kp_actuel = Kp;
-    kd_actuel = Kd;
+    ecart = tD - tG; kp_actuel = Kp; kd_actuel = Kd;
   }
   else if (commandeEnCours == "rotation_gauche" || commandeEnCours == "rotation_droite") {
-    ecart = abs(tD) - abs(tG);
-    kp_actuel = Kp_rotation;
-    kd_actuel = Kd_rotation;
+    ecart = abs(tD) - abs(tG); kp_actuel = Kp_rotation; kd_actuel = Kd_rotation;
   }
-  else if (commandeEnCours == "vag") {
-    ecart = tG - (long)(tD * RATIO_VIRAGE);
-  }
-  else if (commandeEnCours == "vad") {
-    ecart = tD - (long)(tG * RATIO_VIRAGE);
-  }
-  else if (commandeEnCours == "veg") {
-    ecart = abs(tG) - (long)(abs(tD) * RATIO_VIRAGE);
-  }
-  else if (commandeEnCours == "ved") {
-    ecart = abs(tD) - (long)(abs(tG) * RATIO_VIRAGE);
-  }
+  else if (commandeEnCours == "vag") { ecart = tG - (long)(tD * RATIO_VIRAGE); }
+  else if (commandeEnCours == "vad") { ecart = tD - (long)(tG * RATIO_VIRAGE); }
+  else if (commandeEnCours == "veg") { ecart = abs(tG) - (long)(abs(tD) * RATIO_VIRAGE); }
+  else if (commandeEnCours == "ved") { ecart = abs(tD) - (long)(abs(tG) * RATIO_VIRAGE); }
 
   correctionDynamique = (int)((ecart * kp_actuel) + ((ecart - ecartPrecedent) * kd_actuel));
   ecartPrecedent = ecart;
@@ -396,48 +431,31 @@ void calculerVitesse() {
   pasDroitPrev  = d; pasGauchePrev = g;
 }
 
+// Odometrie : cap = GYRO integre ; distance = encodeurs voie A. ~100 Hz.
 void mettreAJourOdometrie() {
-  if (millis() - tDerniereOdo < 10) return;
-  tDerniereOdo = millis();
+  uint32_t now = millis();
+  if (now - tDerniereOdo < 10) return;
+  float dt = (now - tDerniereOdo) / 1000.0f;
+  tDerniereOdo = now;
 
-  noInterrupts(); 
-  long actuelsD = ticksOdoDroit; 
-  long actuelsG = ticksOdoGauche; 
+  // 1) Cap : integration gyro (lecture ralentie a 100 Hz)
+  majCapGyro(dt);
 
-  interrupts();
+  // 2) Distance : deltas des compteurs voie A (magnitude = avance)
+  noInterrupts(); long pd = pasDroit; long pg = pasGauche; interrupts();
+  long dPd = pd - odoPasDprev; long dPg = pg - odoPasGprev;
+  odoPasDprev = pd; odoPasGprev = pg;
 
-  long deltaTicksD = actuelsD - pasDroitOdoPrev; 
-  long deltaTicksG = actuelsG - pasGaucheOdoPrev;
-
-  pasDroitOdoPrev  = actuelsD; 
-  pasGaucheOdoPrev = actuelsG;
-
-  // ROBOT A L'ARRET : on fige la pose. Sinon le bruit/derive du cap fait
-  // "bouger" le stylo (amplifie par l'offset stylo de 127 mm) alors qu'il
-  // est immobile. On garde les references a jour pour ne pas sauter au depart.
-
-  float distD = (float)deltaTicksD * CM_PAR_TICK;
-  float distG = (float)deltaTicksG * CM_PAR_TICK;
-  // Signe porte par les ticks SIGNES : en rotation pure distD ~= -distG -> somme ~ 0.
+  float distD = (float)dPd * CM_PAR_TICK;
+  float distG = (float)dPg * CM_PAR_TICK;
   float deltaDCentre = (distD + distG) / 2.0;
 
-  // Moyenne d'angle sans saut au passage 360 -> 0
-  float delta = capGlobal - capGlobalPrev;
-  if (delta >  180.0) delta -= 360.0;
-  if (delta < -180.0) delta += 360.0;
-  float angleMoyenDeg = capGlobalPrev + delta / 2.0;
-  capGlobalPrev = capGlobal;
+  // 3) Integration de la pose avec le cap gyro
+  Centre_Robot_X += deltaDCentre * cos(capGyroRad);
+  Centre_Robot_Y += deltaDCentre * sin(capGyroRad);
 
-  float capVirtuelDeg = angleMoyenDeg - capInitialAuReset;
-  float capRad = capVirtuelDeg * PI / 180.0;
-
-  // Calcul interne INCHANGE (ne pas permuter cos/sin ici : l'offset stylo
-  // et le sens de rotation y sont cales). L'echange X/Y se fait a l'affichage.
-  Centre_Robot_X += deltaDCentre * cos(capRad);
-  Centre_Robot_Y += deltaDCentre * sin(capRad);
-
-  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capRad);
-  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capRad);
+  x_stylo = Centre_Robot_X + DISTANCE_MI_ENTRAXE_STYLO * cos(capGyroRad);
+  y_stylo = Centre_Robot_Y + DISTANCE_MI_ENTRAXE_STYLO * sin(capGyroRad);
 }
 
 // INTERFACE HTML
@@ -490,7 +508,7 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <button id="btn-escalier">🪜 Lancer Séquence Escalier</button>
   <div class="seq-status">Séquence : <b id="seq-etat">inactive</b></div>
   <div class="cap-box">
-    <span class="data-label">🧭 CAP (°)</span>
+    <span class="data-label">🧭 CAP gyro (°)</span>
     <span class="data-val cap" id="cap-val">—</span>
   </div>
   <div class="data-box">
@@ -523,7 +541,7 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
         document.getElementById('sty-y').textContent = d.sy.toFixed(1);
         const e = document.getElementById('seq-etat');
         const b = document.getElementById('btn-escalier');
-        if (d.seq) { e.textContent = 'EN COURS (cible ' + (d.seqpt + 1) + '/3)'; b.classList.add('running'); }
+        if (d.seq) { e.textContent = 'EN COURS (pt ' + (d.seqpt + 1) + '/' + d.seqn + ')'; b.classList.add('running'); }
         else { e.textContent = 'inactive'; b.classList.remove('running'); }
       } catch(e) {}
     }, 150);
@@ -536,36 +554,36 @@ void handleRoot() { server.send_P(200, "text/html", PAGE_HTML); }
 
 void handleCmd() {
   if (server.hasArg("action")) {
-    sequenceActive = false;
-    phaseSequence = SEQ_INACTIVE;
+    sequenceActive = false;     // tout bouton manuel coupe l'autopilote
     definirCommande(server.arg("action"));
   }
   server.send(200, "text/plain", "ok");
 }
 
 void handlePositions() {
-  // Echange X/Y a l'affichage : on montre Y a la place de X et inversement.
   float robX, robY, styX, styY;
   if (ECHANGER_AFFICHAGE) {
-    robX = Centre_Robot_Y * 10.0; 
-    robY = Centre_Robot_X * 10.0;
-    styX = y_stylo        * 10.0; 
-    styY = x_stylo        * 10.0;
+    robX = Centre_Robot_Y * 10.0;  robY = Centre_Robot_X * 10.0;
+    styX = y_stylo        * 10.0;  styY = x_stylo        * 10.0;
   } else {
-    robX = Centre_Robot_X * 10.0; robY = Centre_Robot_Y * 10.0;
-    styX = x_stylo        * 10.0; styY = y_stylo        * 10.0;
+    robX = Centre_Robot_X * 10.0;  robY = Centre_Robot_Y * 10.0;
+    styX = x_stylo        * 10.0;  styY = y_stylo        * 10.0;
   }
 
-  char json[200];
+  // CAP affiche = cap GYRO (celui qui pilote), en degres [-180,180].
+  // VERIFICATIONS :
+  //  - pousser le robot tout droit -> Stylo X augmente, Stylo Y ~constant ;
+  //  - faire tourner le robot 360 deg REEL -> ce CAP doit afficher ~360 (ou -360).
+  //    Si non, ajuster GYRO_SCALE_CORR = 360 / (valeur lue). Si sens inverse,
+  //    passer INVERSER_GYRO a true.
+  float capDeg = capGyroRad * 180.0 / PI;
+  while (capDeg > 180.0)  capDeg -= 360.0;
+  while (capDeg < -180.0) capDeg += 360.0;
 
-  // Remplace capGlobal par le calcul relatif
-float capRelatif = capGlobal - capInitialAuReset;
-if (capRelatif > 180.0) capRelatif -= 360.0;
-if (capRelatif < -180.0) capRelatif += 360.0;
-
-snprintf(json, sizeof(json),
-  "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d}",
-  robX, robY, styX, styY, capRelatif, sequenceActive ? 1 : 0, indexPointEscalier);
+  char json[220];
+  snprintf(json, sizeof(json),
+    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d,\"seqn\":%d}",
+    robX, robY, styX, styY, capDeg, sequenceActive ? 1 : 0, wpIndex, wpCount);
   server.send(200, "application/json", json);
 }
 
@@ -636,8 +654,8 @@ void setup() {
   ledcSetup(canalDroit,  freq, resolution); ledcAttachPin(EN_D, canalDroit);
   ledcSetup(canalGauche, freq, resolution); ledcAttachPin(EN_G, canalGauche);
 
+  // Encodeurs : interruption legere voie A (front montant) pour pasDroit/pasGauche.
   pinMode(ENC_D_CH_A, INPUT_PULLUP); pinMode(ENC_G_CH_A, INPUT_PULLUP);
-  pinMode(ENC_D_CH_B, INPUT_PULLUP); pinMode(ENC_G_CH_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), ISR_Droit,  RISING);
   attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), ISR_Gauche, RISING);
 
@@ -659,15 +677,20 @@ void setup() {
 
   capGlobal = obtenirCapMagnetometre();
   reinitialiserRepereCartesien();
-  tDernierKalman = millis(); tDerniereVit = millis(); tDerniereOdo = millis();
+  tDernierKalman = millis(); tDerniereVit = millis();
+  tDerniereOdo = millis();   tDernierGyro = millis();
 }
 
 void loop() {
   server.handleClient();
-  executerFiltreKalman();
-  gererSequenceEscalier();
-  appliquerCommande();
-  corrigerPD();
+  executerFiltreKalman();     // magneto/Kalman : seulement hors sequence (affichage)
   calculerVitesse();
-  mettreAJourOdometrie();
+  mettreAJourOdometrie();     // cap gyro + pose (toujours)
+
+  if (sequenceActive) {
+    gererSequenceEscalier();
+  } else {
+    appliquerCommande();
+    corrigerPD();
+  }
 }
