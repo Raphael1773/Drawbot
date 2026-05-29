@@ -90,6 +90,17 @@ const bool INVERSER_CAP   = false;  // si capGlobal augmente dans le mauvais sen
 const bool INVERSER_GYRO  = false;  // si le gyro Z est oppose au magneto
 float capInitialAuReset = 0.0;
 
+// ---------------------------------------------------------------------
+//  ECHANGE DES AXES X <-> Y
+//  On NE TOUCHE PAS au calcul interne (cos/sin) : l'offset stylo au reset
+//  et le sens de rotation de l'autopilote y sont cales. On echange les axes
+//  uniquement aux frontieres :
+//   - ECHANGER_AFFICHAGE : permute X/Y dans le JSON envoye a la page HTML.
+//   - ECHANGER_CIBLES    : permute X/Y des points de la sequence escalier
+//                          (=> reflechit le dessin physiquement).
+const bool ECHANGER_AFFICHAGE = true;
+const bool ECHANGER_CIBLES    = false;
+
 const int INTERVALLE_VITESSE_MS = 200;
 float vitesseDcms  = 0.0;
 float vitesseGcms  = 0.0;
@@ -108,7 +119,7 @@ uint32_t tDernierKalman = 0;
 struct Kalman1D {
   float Q_angle = 0.001f;
   float Q_bias  = 0.003f;
-  float R_measure = 0.03f;
+  float R_measure = 0.03f;   // baisser vers 0.02 si le cap jitter trop (+ confiance magneto)
   float angle = 0.0f;
   float bias  = 0.0f;
   float P[2][2] = {{0, 0}, {0, 0}};
@@ -165,9 +176,7 @@ int correctionDynamique = 0;
 
 // =====================================================================
 //  SEQUENCE AUTONOME "ESCALIER"
-//      trait (0,0)   -> (150,0)
-//      trait (150,0) -> (150,200)
-//      trait (150,200)-> (350,200)   (coordonnees en mm)
+//      (0,0) -> (150,0) -> (150,200) -> (350,200)   (coordonnees en mm)
 //  Cibles a atteindre depuis (0,0) : (150,0) puis (150,200) puis (350,200).
 // =====================================================================
 
@@ -216,7 +225,7 @@ float obtenirCapMagnetometre() {
   float ny = (my - CALIB_Y_OFFSET) / CALIB_Y_SCALE;
   float cap = atan2(-ny, nx) * 180.0 / PI;
   if (cap < 0) cap += 360.0;
-  if (INVERSER_CAP) cap = 360.0 - cap;   // inverse le sens sans bouger le zero
+  if (INVERSER_CAP) cap = 360.0 - cap;
   return cap;
 }
 
@@ -276,8 +285,15 @@ void arreterSequence() {
 void gererSequenceEscalier() {
   if (!sequenceActive) return;
 
-  float cibleX = CIBLE_X_MM[indexPointEscalier] / 10.0;
-  float cibleY = CIBLE_Y_MM[indexPointEscalier] / 10.0;
+  // Cible courante en cm. Echange X/Y optionnel (dessin physique transpose).
+  float cibleX, cibleY;
+  if (ECHANGER_CIBLES) {
+    cibleX = CIBLE_Y_MM[indexPointEscalier] / 10.0;
+    cibleY = CIBLE_X_MM[indexPointEscalier] / 10.0;
+  } else {
+    cibleX = CIBLE_X_MM[indexPointEscalier] / 10.0;
+    cibleY = CIBLE_Y_MM[indexPointEscalier] / 10.0;
+  }
 
   float dx = cibleX - x_stylo;
   float dy = cibleY - y_stylo;
@@ -371,6 +387,14 @@ void mettreAJourOdometrie() {
   long deltaTicksD = actuelsD - pasDroitOdoPrev; long deltaTicksG = actuelsG - pasGaucheOdoPrev;
   pasDroitOdoPrev  = actuelsD; pasGaucheOdoPrev = actuelsG;
 
+  // ROBOT A L'ARRET : on fige la pose. Sinon le bruit/derive du cap fait
+  // "bouger" le stylo (amplifie par l'offset stylo de 127 mm) alors qu'il
+  // est immobile. On garde les references a jour pour ne pas sauter au depart.
+  if (commandeEnCours == "stop") {
+    capGlobalPrev = capGlobal;
+    return;
+  }
+
   float distD = (float)deltaTicksD * CM_PAR_TICK;
   float distG = (float)deltaTicksG * CM_PAR_TICK;
   // Signe porte par les ticks SIGNES : en rotation pure distD ~= -distG -> somme ~ 0.
@@ -386,6 +410,8 @@ void mettreAJourOdometrie() {
   float capVirtuelDeg = angleMoyenDeg - capInitialAuReset;
   float capRad = capVirtuelDeg * PI / 180.0;
 
+  // Calcul interne INCHANGE (ne pas permuter cos/sin ici : l'offset stylo
+  // et le sens de rotation y sont cales). L'echange X/Y se fait a l'affichage.
   Centre_Robot_X += deltaDCentre * cos(capRad);
   Centre_Robot_Y += deltaDCentre * sin(capRad);
 
@@ -418,7 +444,10 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
     .data-label { font-size: 0.78rem; color: #888; align-self: center; }
     .data-val { font-size: 1rem; font-weight: bold; text-align: right; font-family: monospace; }
-    .data-val.robot { color: #0f8; } .data-val.stylo { color: #f0f; }
+    .data-val.robot { color: #0f8; } .data-val.stylo { color: #f0f; } .data-val.cap { color: #0af; }
+    .cap-box { background: #1a1a1a; border: 1px solid #333; border-radius: 16px; padding: 12px 24px; width: 290px; display: flex; justify-content: space-between; align-items: center; }
+    .cap-box .data-label { font-size: 0.85rem; }
+    .cap-box .data-val { font-size: 1.6rem; }
     .seq-status { font-size: 0.8rem; color: #888; text-align: center; }
     .seq-status b { color: #0f8; }
   </style>
@@ -439,6 +468,10 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
   <button id="btn-cart-reset">🎯 Reset Repère Cartésien</button>
   <button id="btn-escalier">🪜 Lancer Séquence Escalier</button>
   <div class="seq-status">Séquence : <b id="seq-etat">inactive</b></div>
+  <div class="cap-box">
+    <span class="data-label">🧭 CAP (°)</span>
+    <span class="data-val cap" id="cap-val">—</span>
+  </div>
   <div class="data-box">
     <h2 style="color:#f0f; font-size:0.9rem;">📍 COORDONNÉES (mm)</h2>
     <div class="data-grid">
@@ -462,6 +495,7 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     setInterval(async () => {
       try {
         const r = await fetch('/pos'); const d = await r.json();
+        document.getElementById('cap-val').textContent = d.cap.toFixed(1);
         document.getElementById('rob-x').textContent = d.rx.toFixed(1);
         document.getElementById('rob-y').textContent = d.ry.toFixed(1);
         document.getElementById('sty-x').textContent = d.sx.toFixed(1);
@@ -489,11 +523,20 @@ void handleCmd() {
 }
 
 void handlePositions() {
-  char json[160];
+  // Echange X/Y a l'affichage : on montre Y a la place de X et inversement.
+  float robX, robY, styX, styY;
+  if (ECHANGER_AFFICHAGE) {
+    robX = Centre_Robot_Y * 10.0; robY = Centre_Robot_X * 10.0;
+    styX = y_stylo        * 10.0; styY = x_stylo        * 10.0;
+  } else {
+    robX = Centre_Robot_X * 10.0; robY = Centre_Robot_Y * 10.0;
+    styX = x_stylo        * 10.0; styY = y_stylo        * 10.0;
+  }
+
+  char json[200];
   snprintf(json, sizeof(json),
-    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"seq\":%d,\"seqpt\":%d}",
-    Centre_Robot_X * 10.0, Centre_Robot_Y * 10.0, x_stylo * 10.0, y_stylo * 10.0,
-    sequenceActive ? 1 : 0, indexPointEscalier);
+    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d}",
+    robX, robY, styX, styY, capGlobal, sequenceActive ? 1 : 0, indexPointEscalier);
   server.send(200, "application/json", json);
 }
 
