@@ -119,7 +119,7 @@ uint32_t tDernierKalman = 0;
 struct Kalman1D {
   float Q_angle = 0.001f;
   float Q_bias  = 0.003f;
-  float R_measure = 0.03f;   // baisser vers 0.02 si le cap jitter trop (+ confiance magneto)
+  float R_measure = 0.02f;   // baisser vers 0.02 si le cap jitter trop (+ confiance magneto)
   float angle = 0.0f;
   float bias  = 0.0f;
   float P[2][2] = {{0, 0}, {0, 0}};
@@ -383,9 +383,17 @@ void mettreAJourOdometrie() {
   if (millis() - tDerniereOdo < 10) return;
   tDerniereOdo = millis();
 
-  noInterrupts(); long actuelsD = ticksOdoDroit; long actuelsG = ticksOdoGauche; interrupts();
-  long deltaTicksD = actuelsD - pasDroitOdoPrev; long deltaTicksG = actuelsG - pasGaucheOdoPrev;
-  pasDroitOdoPrev  = actuelsD; pasGaucheOdoPrev = actuelsG;
+  noInterrupts(); 
+  long actuelsD = ticksOdoDroit; 
+  long actuelsG = ticksOdoGauche; 
+
+  interrupts();
+
+  long deltaTicksD = actuelsD - pasDroitOdoPrev; 
+  long deltaTicksG = actuelsG - pasGaucheOdoPrev;
+
+  pasDroitOdoPrev  = actuelsD; 
+  pasGaucheOdoPrev = actuelsG;
 
   // ROBOT A L'ARRET : on fige la pose. Sinon le bruit/derive du cap fait
   // "bouger" le stylo (amplifie par l'offset stylo de 127 mm) alors qu'il
@@ -526,17 +534,25 @@ void handlePositions() {
   // Echange X/Y a l'affichage : on montre Y a la place de X et inversement.
   float robX, robY, styX, styY;
   if (ECHANGER_AFFICHAGE) {
-    robX = Centre_Robot_Y * 10.0; robY = Centre_Robot_X * 10.0;
-    styX = y_stylo        * 10.0; styY = x_stylo        * 10.0;
+    robX = Centre_Robot_Y * 10.0; 
+    robY = Centre_Robot_X * 10.0;
+    styX = y_stylo        * 10.0; 
+    styY = x_stylo        * 10.0;
   } else {
     robX = Centre_Robot_X * 10.0; robY = Centre_Robot_Y * 10.0;
     styX = x_stylo        * 10.0; styY = y_stylo        * 10.0;
   }
 
   char json[200];
-  snprintf(json, sizeof(json),
-    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d}",
-    robX, robY, styX, styY, capGlobal, sequenceActive ? 1 : 0, indexPointEscalier);
+
+  // Remplace capGlobal par le calcul relatif
+float capRelatif = capGlobal - capInitialAuReset;
+if (capRelatif > 180.0) capRelatif -= 360.0;
+if (capRelatif < -180.0) capRelatif += 360.0;
+
+snprintf(json, sizeof(json),
+  "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d}",
+  robX, robY, styX, styY, capRelatif, sequenceActive ? 1 : 0, indexPointEscalier);
   server.send(200, "application/json", json);
 }
 
