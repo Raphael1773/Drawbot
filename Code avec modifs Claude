@@ -33,8 +33,21 @@
 volatile long pasDroit  = 0;
 volatile long pasGauche = 0;
 
-void IRAM_ATTR ISR_Droit()  { pasDroit++;  }
-void IRAM_ATTR ISR_Gauche() { pasGauche++; }
+// Compteurs d'odometrie (magnitude, incrementes par les ISR ci-dessus).
+// Dedies a l'odometrie : JAMAIS remis a zero par definirCommande (seul le reset
+// cartesien les remet a zero) -> pas de saut de position au changement de commande.
+volatile long odoTicksD = 0;
+volatile long odoTicksG = 0;
+
+
+float dbgErrA = 0, dbgCorrA = 0, dbgCorrD = 0;
+
+// PID manuel : interruption legere voie A (front montant), comme l'origine.
+// PID manuel (voie A, front montant) + compteurs d'odometrie (magnitude).
+// odoTicksD/G : dedies a l'odometrie, JAMAIS remis a zero par definirCommande
+// (seul le reset cartesien les remet a zero) -> pas de saut de position.
+void IRAM_ATTR ISR_Droit()  { pasDroit++;  odoTicksD++; }
+void IRAM_ATTR ISR_Gauche() { pasGauche++; odoTicksG++; }
 
 #define SDA_PIN 21
 #define SCL_PIN 22
@@ -174,48 +187,57 @@ long ecartPrecedent  = 0;
 int correctionDynamique = 0;
 
 // =====================================================================
-//  SEQUENCE AUTONOME "ESCALIER"
-//  Coins (cm) : (0,0) -> (20,0) -> (20,10) -> (60,10)
-//  Poursuite referencee CENTRE (pas de balancement du stylo) avec lookahead.
-//  Cap = GYRO integre (capGyroRad). Distance = encodeurs voie A.
-//
-//  VALIDATION DES POINTS (correctif 2e virage) : on coche TOUS les points
-//  deja depasses a chaque tour (boucle while), et un point est "depasse"
-//  des que le point suivant est plus proche du stylo que lui (d1 < d0),
-//  meme si le stylo n'est jamais passe a moins de ARRIVE_CM (cas du coin
-//  coupe par l'interieur). Cela empeche wpIndex de se bloquer au coin.
+//  SEQUENCES (toutes celles de Julien, adaptees a ta base capteurs)
+//  Principe de Julien, reproduit a l'identique :
+//    - vasla(x,y)               -> empile UN point dans la file (en mm)
+//    - trajectoirefaituntrait   -> densifie un segment en points (vasla)
+//    - trajectoirefaituncercle  -> densifie un arc en points (vasla)
+//    - chaque sequence (escalier, carre, fleche...) remplit la file
+//  La machine a etats parcourt la file avec le PID complet de Julien
+//  (visee CENTRE, P+I+D angle+distance, turn-first). Capteurs = LES TIENS :
+//  cap = GYRO (capGyroRad, +-500 calibre), distance = encodeurs (voie A).
+//  Tout en MM (comme Julien) pour reutiliser ses gains tels quels.
 // =====================================================================
-const int   NB_COINS = 4;
-const float COIN_X_CM[NB_COINS] = { 0.0, 20.0, 20.0, 60.0 };
-const float COIN_Y_CM[NB_COINS] = { 0.0,  0.0, 20.0, 20.0 };
 
-const float PAS_WP_CM = 0.5;          // points tous les 5 mm
+// --- Constantes EXACTES de Julien ("MARCHE DE OUF") ---
+const float DISTANCESTYLO   = 127.0;   // mm (ton deport : 12,7 cm)
+const float DIFFMMPARPOINT  = 5.0;     // densification : un point tous les 5 mm
+const float MINDISTPOINT    = 7.0;     // mm : boite d'arrivee
+const uint32_t TEMPSDARRETFIN = 70;    // ms : il faut rester dans la boite ce temps
+const uint32_t TIMEOUT_PT_MS  = 15000; // ms : timeout par point (comme Julien)
 
-const int   LOOKAHEAD_PTS   = 4;      // vise le point idx+4 (~2 cm devant)
-const int   MAX_SAUT_PAR_CYCLE = 3;   // anti-cascade : au plus 3 points valides/cycle
-                                      // (empeche d'avaler tout un segment pendant un virage)
-const float ARRIVE_CM       = 1.0;    // valide un point quand le stylo passe a <10 mm
-const float ARRIVE_FINAL_CM = 0.6;    // tolerance sur le tout dernier point
-const uint32_t TIMEOUT_SEQ_MS = 25000;// securite globale
+const float MAXANGLEDIFF = 0.20;       // rad : au-dela on pivote (consigne_dist=0)
+// PID angle (P+I+D) -- gains Julien
+const float KpAngle = 150.0, KiAngle = 0, KdAngle = 8.1;
+const float MAXERR_ANGLE = 26.0, MAXPID_ANGLE = 100.0;
+// PID distance (P+I+D) -- gains Julien (consignes en mm)
+const float KpDist = 0.7, KiDist = 1.07, KdDist = 14.7;
+const float MAXERR_DIST = 44.0;
+const float VMAX_MOTEUR = 255.0;       // borne PWM
 
-const float KP_A    = 80.0;   // correction d'angle (rad -> pwm)
-const float CA_MAX  = 150.0;   // bride la correction d'angle
-const float VCRUISE = 150.0;   // vitesse d'avance constante (monter = + de pousse)
-const float VMAX_SEQ = 220.0;  // borne PWM par moteur
+// File de waypoints (en mm). Agrandie pour les figures riches (carres concentriques).
+const int   MAX_WP = 1200;
+float wpX[MAX_WP];
+float wpY[MAX_WP];
+int   wpCount = 0;       // nombre de points dans la file
+int   wpIndex = 0;       // point courant
 
+bool     sequenceActive = false;
+uint32_t tDebutPt = 0;          // chrono timeout du point courant
+uint32_t tDansLaBoite = 0;      // chrono "reste dans la boite"
+bool     dansLaBoite = false;
+uint32_t tDerniereSeqCorr = 0;
+// memoire PID (sommes integrales + erreurs precedentes)
+float sErrAngle = 0, ePrevAngle = 0;
+float sErrDist  = 0, ePrevDist  = 0;
+float vGseq = 0, vDseq = 0;     // dernieres commandes moteur sequence (pour detecter le pivot)
 // Si le robot tourne a l'envers pendant le suivi : passer a true.
 const bool INVERSER_SENS_ROTATION = false;
 
-const int   MAX_WP = 200;
-float wpX[MAX_WP];
-float wpY[MAX_WP];
-bool  wpCoin[MAX_WP];
-int   wpCount = 0;
-
-bool     sequenceActive = false;
-int      wpIndex = 0;
-uint32_t tDebutSeq = 0;
-uint32_t tDerniereSeqCorr = 0;
+// Identifiant de la sequence demandee depuis la page web
+enum SeqId { SEQ_AUCUNE=0, SEQ_ESCALIER, SEQ_ESCALIER2, SEQ_CARRE, SEQ_SEQUENCE1,
+             SEQ_ANGLEDROIT, SEQ_CARRES_CONC, SEQ_CARRES_CONC2, SEQ_FLECHE };
+volatile int seqDemandee = SEQ_AUCUNE;
 
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
@@ -288,6 +310,7 @@ void majCapGyro(float dt) {
 void reinitialiserRepereCartesien() {
   noInterrupts();
   pasDroit = 0; pasGauche = 0;
+  odoTicksD = 0; odoTicksG = 0;
   interrupts();
 
   capGyroRad = 0.0;                 // cap gyro : 0 = oriente vers +X
@@ -335,32 +358,107 @@ float normRad(float a) {
   return a;
 }
 
-void construireWaypoints() {
-  wpCount = 0;
-  for (int s = 0; s < NB_COINS - 1; s++) {
-    float ax = COIN_X_CM[s],     ay = COIN_Y_CM[s];
-    float bx = COIN_X_CM[s + 1], by = COIN_Y_CM[s + 1];
-    if (ECHANGER_CIBLES) { float t; t = ax; ax = ay; ay = t; t = bx; bx = by; by = t; }
-    float seg = sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
-    int n = (int)(seg / PAS_WP_CM);
-    if (n < 1) n = 1;
-    for (int i = 1; i <= n && wpCount < MAX_WP; i++) {
-      float t = (float)i / (float)n;
-      wpX[wpCount] = ax + (bx - ax) * t;
-      wpY[wpCount] = ay + (by - ay) * t;
-      wpCoin[wpCount] = (i == n);
-      wpCount++;
-    }
+// === Primitives de Julien : empilent des points dans la file (en mm) ===
+void vasla(float x, float y) {
+  if (wpCount < MAX_WP) { wpX[wpCount] = x; wpY[wpCount] = y; wpCount++; }
+}
+
+void trajectoirefaituntrait(float debutx, float debuty, float finx, float finy) {
+  float distance = sqrt((finx-debutx)*(finx-debutx) + (finy-debuty)*(finy-debuty));
+  int n = (int)(distance / DIFFMMPARPOINT); if (n < 1) n = 1;
+  for (int i = 1; i <= n; i++) {
+    float x = debutx + (finx-debutx) * (float)i / (float)n;
+    float y = debuty + (finy-debuty) * (float)i / (float)n;
+    vasla(x, y);
   }
 }
 
-void demarrerSequenceEscalier() {
+void trajectoirefaituncercle(float cX, float cY, float rayon, float aDebut, float aFin) {
+  int n = (int)fabs((aFin - aDebut) * rayon / DIFFMMPARPOINT); if (n < 1) n = 1;
+  for (int i = 0; i <= n; i++) {
+    float a = aDebut + (aFin - aDebut) * (float)i / (float)n;
+    vasla(cX + rayon * cos(a), cY + rayon * sin(a));
+  }
+}
+
+// === Sequences de Julien (copiees a l'identique) ===
+void seqEscalier() {
+  trajectoirefaituntrait(0,0,150,0);
+  trajectoirefaituntrait(150,0,150,200);
+  trajectoirefaituntrait(150,200,350,200);
+}
+void seqEscalier2() {
+  trajectoirefaituntrait(0,0,150,150);
+  trajectoirefaituntrait(150,150,0,300);
+  trajectoirefaituntrait(0,300,150,450);
+}
+void seqCarre() {
+  vasla(200,0); vasla(0,0); vasla(0,200); vasla(200,200);
+}
+void seqSequence1() {
+  vasla(0,0); vasla(400,0); vasla(400,200); vasla(1000,200);
+}
+void seqAngleDroit() {
+  vasla(0,0); vasla(25,0); vasla(50,0); vasla(75,0); vasla(100,0);
+  vasla(125,0); vasla(150,0);
+  vasla(150,25); vasla(150,50); vasla(150,75); vasla(150,100); vasla(150,150);
+}
+void seqCarresConc() {
+  trajectoirefaituntrait(0,0,90,0);  trajectoirefaituntrait(90,0,90,90);
+  trajectoirefaituntrait(90,90,0,90); trajectoirefaituntrait(0,90,0,15);
+  trajectoirefaituntrait(0,15,75,15); trajectoirefaituntrait(75,15,75,75);
+  trajectoirefaituntrait(75,75,15,75); trajectoirefaituntrait(15,75,15,30);
+  trajectoirefaituntrait(15,30,60,30); trajectoirefaituntrait(60,30,60,60);
+  trajectoirefaituntrait(60,60,30,60); trajectoirefaituntrait(30,60,30,39);
+  trajectoirefaituntrait(30,39,51,39); trajectoirefaituntrait(51,39,51,51);
+  trajectoirefaituntrait(51,51,39,51);
+}
+void seqCarresConc2() {
+  trajectoirefaituntrait(0,0,450,0);     trajectoirefaituntrait(450,0,450,450);
+  trajectoirefaituntrait(450,450,0,450); trajectoirefaituntrait(0,450,0,45);
+  trajectoirefaituntrait(0,45,405,45);   trajectoirefaituntrait(405,45,405,405);
+  trajectoirefaituntrait(405,405,45,405);trajectoirefaituntrait(45,405,45,90);
+  trajectoirefaituntrait(45,90,360,90);  trajectoirefaituntrait(360,90,360,360);
+  trajectoirefaituntrait(360,360,90,360);trajectoirefaituntrait(90,360,90,135);
+  trajectoirefaituntrait(90,135,315,135);trajectoirefaituntrait(315,135,315,315);
+  trajectoirefaituntrait(315,315,135,315);trajectoirefaituntrait(135,315,135,180);
+  trajectoirefaituntrait(135,180,270,180);trajectoirefaituntrait(270,180,270,270);
+  trajectoirefaituntrait(270,270,180,270);trajectoirefaituntrait(180,270,180,207);
+}
+void seqFleche() {
+  trajectoirefaituntrait(0,0,100,0);
+  trajectoirefaituntrait(100,0,70,-15);
+  trajectoirefaituntrait(70,-15,70,15);
+  trajectoirefaituntrait(70,15,100,0);
+}
+
+// Remplit la file selon la sequence demandee
+void construireSequence(int id) {
+  wpCount = 0;
+  switch (id) {
+    case SEQ_ESCALIER:     seqEscalier();     break;
+    case SEQ_ESCALIER2:    seqEscalier2();    break;
+    case SEQ_CARRE:        seqCarre();        break;
+    case SEQ_SEQUENCE1:    seqSequence1();    break;
+    case SEQ_ANGLEDROIT:   seqAngleDroit();   break;
+    case SEQ_CARRES_CONC:  seqCarresConc();   break;
+    case SEQ_CARRES_CONC2: seqCarresConc2();  break;
+    case SEQ_FLECHE:       seqFleche();       break;
+    default: break;
+  }
+}
+
+void demarrerSequence(int id) {
+  Serial.printf(">> Sequence demarree : %d points\n", wpCount);
   arreterMoteurs();
-  calibrerGyro();                 // re-estime le biais gyro (robot immobile au lancement)
+  calibrerGyro();
   reinitialiserRepereCartesien();
-  construireWaypoints();
+  construireSequence(id);
   wpIndex = 0;
-  tDebutSeq = millis();
+  tDebutPt = millis();
+  tDansLaBoite = millis();
+  dansLaBoite = false;
+  sErrAngle = ePrevAngle = sErrDist = ePrevDist = 0;
   tDerniereSeqCorr = millis();
   tDernierGyro = millis();
   sequenceActive = (wpCount > 0);
@@ -372,55 +470,106 @@ void arreterSequence() {
   definirCommande("stop");
 }
 
-// Poursuite referencee CENTRE + lookahead, avance a vitesse constante.
-// Braquage sur le cap GYRO (capGyroRad). On ne pivote JAMAIS sur place.
+// === calculpidavecposstylo de Julien (visee CENTRE, PID complet, turn-first) ===
+// Tout en MM. cap = capGyroRad. Pose centre/stylo en mm (pose interne *10).
+void pidVersPoint(float cx_mm, float cy_mm, float px_mm, float py_mm,
+                  float consignex, float consigney) {
+  // consigne_distance = dist(centre, cible) - DISTANCESTYLO
+  float consigne_distance = sqrt((consignex-cx_mm)*(consignex-cx_mm)
+                               + (consigney-cy_mm)*(consigney-cy_mm)) - DISTANCESTYLO;
+  float consigne_angle = atan2(consigney - cy_mm, consignex - cx_mm);
+  float angleActuel    = capGyroRad;
+
+  // PID ANGLE (P+I+D)
+  float errA = normRad(consigne_angle - angleActuel);
+  sErrAngle += errA; sErrAngle = constrain(sErrAngle, -MAXERR_ANGLE, MAXERR_ANGLE);
+  float correctionAngle = KpAngle*errA + KiAngle*sErrAngle + KdAngle*(errA - ePrevAngle);
+  ePrevAngle = errA;
+  correctionAngle = constrain(correctionAngle, -MAXPID_ANGLE, MAXPID_ANGLE);
+  if (INVERSER_SENS_ROTATION) correctionAngle = -correctionAngle;
+
+  // turn-first : si l'angle est trop grand, on n'avance pas (consigne_dist = 0)
+  bool derriere = (fabs(errA) > MAXANGLEDIFF);
+  if (derriere) consigne_distance = 0;
+
+  // PID DISTANCE (P+I+D), consigne = 0, input = -consigne_distance -> erreur = consigne_distance
+  float correctionDistance;
+  if (derriere) { correctionDistance = 0; sErrDist = 0; ePrevDist = 0; }
+  else {
+    float errD = consigne_distance;     // PIDdistance(0, consigne_distance) -> erreur = consigne_distance
+    sErrDist += errD; sErrDist = constrain(sErrDist, -MAXERR_DIST, MAXERR_DIST);
+    correctionDistance = KpDist*errD + KiDist*sErrDist + KdDist*(errD - ePrevDist);
+    ePrevDist = errD;
+  }
+
+  float vG = correctionDistance - correctionAngle;
+  float vD = correctionDistance + correctionAngle;
+  vG = constrain(vG, -VMAX_MOTEUR, VMAX_MOTEUR);
+  vD = constrain(vD, -VMAX_MOTEUR, VMAX_MOTEUR);
+  const float PWM_MIN_DEMARRAGE = 110.0;   // a ajuster selon ta zone morte
+  if (vG > 1 && vG < PWM_MIN_DEMARRAGE) vG = PWM_MIN_DEMARRAGE;
+  if (vG < -1 && vG > -PWM_MIN_DEMARRAGE) vG = -PWM_MIN_DEMARRAGE;
+  if (vD > 1 && vD < PWM_MIN_DEMARRAGE) vD = PWM_MIN_DEMARRAGE;
+  if (vD < -1 && vD > -PWM_MIN_DEMARRAGE) vD = -PWM_MIN_DEMARRAGE;
+  vGseq = vG; vDseq = vD;
+  Serial.printf("errA=%.2f corrA=%.1f corrD=%.1f vG=%.1f vD=%.1f\n",
+                errA, correctionAngle, correctionDistance, vG, vD);
+  dbgErrA = errA; dbgCorrA = correctionAngle; dbgCorrD = correctionDistance;
+  moteurGauche(vG);
+  moteurDroite(vD);
+}
+
+// vasla non-bloquant : pilote vers wp[wpIndex] jusqu'a rester dans la boite
+// +-MINDISTPOINT pendant TEMPSDARRETFIN, ou timeout TIMEOUT_PT_MS, puis suivant.
 void gererSequenceEscalier() {
   if (!sequenceActive) return;
 
-  if (millis() - tDebutSeq > TIMEOUT_SEQ_MS) { arreterSequence(); return; }
-
-  // 1. VALIDATION (correctif 2e virage) : on coche les points deja depasses.
-  //    Un point est depasse s'il est proche (< ARRIVE_CM) OU si le point suivant
-  //    est devenu plus proche (d1 < d0). LIMITE a MAX_SAUT_PAR_CYCLE par cycle :
-  //    sinon, pendant un virage, l'arc du stylo (deport 12,7 cm) validerait tout
-  //    un segment court d'un coup (le robot "avalerait" la montee).
-  int sauts = 0;
-  while (wpIndex < wpCount - 1 && sauts < MAX_SAUT_PAR_CYCLE) {
-    float d0 = hypot(wpX[wpIndex]     - x_stylo, wpY[wpIndex]     - y_stylo);
-    float d1 = hypot(wpX[wpIndex + 1] - x_stylo, wpY[wpIndex + 1] - y_stylo);
-    if (d0 < ARRIVE_CM || d1 < d0) { wpIndex++; sauts++; }
-    else break;
-  }
-  // Fin : dernier point atteint
-  if (wpIndex >= wpCount - 1) {
-    float dFin = hypot(wpX[wpCount - 1] - x_stylo, wpY[wpCount - 1] - y_stylo);
-    if (dFin < ARRIVE_FINAL_CM) { arreterSequence(); return; }
-  }
-
-  if (millis() - tDerniereSeqCorr < 10) return;
+  if (millis() - tDerniereSeqCorr < 5) return;   // ~ rythme de Julien
   tDerniereSeqCorr = millis();
 
-  // 2. Visee depuis le CENTRE (pas de balancement du stylo de 12,7 cm),
-  //    avec un lookahead court (~2 cm). Le "d1 < d0" ci-dessus gere deja
-  //    l'anticipation du virage, donc inutile de viser tres loin.
-  int la = wpIndex + LOOKAHEAD_PTS;
-  if (la > wpCount - 1) la = wpCount - 1;
+  // pose en mm
+  float cx_mm = Centre_Robot_X * 10.0;
+  float cy_mm = Centre_Robot_Y * 10.0;
+  float px_mm = x_stylo * 10.0;
+  float py_mm = y_stylo * 10.0;
 
-  float dx = wpX[la] - Centre_Robot_X;
-  float dy = wpY[la] - Centre_Robot_Y;
+  float cible_x = wpX[wpIndex];   // deja en mm
+  float cible_y = wpY[wpIndex];
 
-  float consigneAngle = atan2(dy, dx);
-  float errAngle = normRad(consigneAngle - capGyroRad);
+  // Pilotage PID vers le point courant
+  pidVersPoint(cx_mm, cy_mm, px_mm, py_mm, cible_x, cible_y);
 
-  // 3. Correction d'angle
-  float corrAngle = constrain(KP_A * errAngle, -CA_MAX, CA_MAX);
-  if (INVERSER_SENS_ROTATION) corrAngle = -corrAngle;
-
-  // Ralentissement en virage pour plus de precision
-  float vVoulue = (fabs(errAngle) > 0.15) ? VCRUISE * 0.8 : VCRUISE;
-
-  moteurGauche(constrain(vVoulue - corrAngle, -VMAX_SEQ, VMAX_SEQ));
-  moteurDroite(constrain(vVoulue + corrAngle, -VMAX_SEQ, VMAX_SEQ));
+  // Arrive dans la boite ? (sur le STYLO, comme Julien)
+  bool dedans = (fabs(px_mm - cible_x) < MINDISTPOINT && fabs(py_mm - cible_y) < MINDISTPOINT);
+  if (dedans) {
+    if (!dansLaBoite) { dansLaBoite = true; tDansLaBoite = millis(); }
+    // reste-t-il assez longtemps dans la boite ?
+    if (millis() - tDansLaBoite >= TEMPSDARRETFIN) {
+      // point valide -> suivant
+      if (wpIndex < wpCount - 1) {
+        wpIndex++;
+        Serial.printf("Point %d/%d atteint  stylo=(%.0f,%.0f)  cible=(%.0f,%.0f)\n",
+                      wpIndex, wpCount, px_mm, py_mm, wpX[wpIndex], wpY[wpIndex]);
+        dansLaBoite = false;
+        tDebutPt = millis();
+        sErrAngle = ePrevAngle = sErrDist = ePrevDist = 0;
+      } else {
+        arreterSequence();   // dernier point atteint et stabilise
+      }
+    }
+  } else {
+    dansLaBoite = false;
+    // timeout du point (comme le end=millis()+15000 de Julien)
+    if (millis() - tDebutPt > TIMEOUT_PT_MS) {
+      if (wpIndex < wpCount - 1) {
+        wpIndex++;
+        tDebutPt = millis();
+        sErrAngle = ePrevAngle = sErrDist = ePrevDist = 0;
+      } else {
+        arreterSequence();
+      }
+    }
+  }
 }
 
 void corrigerPD() {
@@ -468,13 +617,18 @@ void mettreAJourOdometrie() {
   // 1) Cap : integration gyro (lecture ralentie a 100 Hz)
   majCapGyro(dt);
 
-  // 2) Distance : deltas des compteurs voie A (magnitude = avance)
-  noInterrupts(); long pd = pasDroit; long pg = pasGauche; interrupts();
+  // 2) Distance : deltas des compteurs DEDIES odo (jamais remis a zero par une
+  //    commande -> plus de saut de position quand le PID manuel reset ses ticks).
+  noInterrupts(); long pd = odoTicksD; long pg = odoTicksG; interrupts();
   long dPd = pd - odoPasDprev; long dPg = pg - odoPasGprev;
   odoPasDprev = pd; odoPasGprev = pg;
 
-  float distD = (float)dPd * CM_PAR_TICK;
-  float distG = (float)dPg * CM_PAR_TICK;
+// Signe de la distance = sens commande aux moteurs (avance + / arriere -).
+  // Pendant la sequence : vGseq/vDseq. En manuel : on deduit du sens courant.
+  float signeD = (vDseq >= 0) ? 1.0 : -1.0;
+  float signeG = (vGseq >= 0) ? 1.0 : -1.0;
+  float distD = (float)dPd * CM_PAR_TICK * signeD;
+  float distG = (float)dPg * CM_PAR_TICK * signeG;
   float deltaDCentre = (distD + distG) / 2.0;
 
   // 3) Integration de la pose avec le cap gyro
@@ -503,9 +657,11 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     .btn.danger:active, .btn.danger.pressed { background: #f44; border-color: #f44; }
     #btn-cart-reset { background: #058; border: 2px solid #08f; border-radius: 12px; color: #fff; font-size: 1rem; font-weight: bold; padding: 12px; width: 290px; cursor: pointer; text-align: center; text-transform: uppercase; }
     #btn-cart-reset:active { background: #0af; transform: scale(0.97); }
-    #btn-escalier { background: #063; border: 2px solid #0a5; border-radius: 12px; color: #fff; font-size: 1rem; font-weight: bold; padding: 12px; width: 290px; cursor: pointer; text-align: center; text-transform: uppercase; }
-    #btn-escalier:active { background: #0c6; transform: scale(0.97); }
-    #btn-escalier.running { background: #0a5; border-color: #0f8; }
+    .seqgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 290px; }
+    .seqbtn { background: #063; border: 2px solid #0a5; border-radius: 12px; color: #fff; font-size: 0.9rem; font-weight: bold; padding: 12px 6px; cursor: pointer; text-align: center; }
+    .seqbtn:active { background: #0c6; transform: scale(0.97); }
+    .seqbtn.stop { grid-column: 1 / span 2; background: #5e0202; border-color: #f44; }
+    .seqbtn.stop:active { background: #f44; }
     .data-box { background: #1a1a1a; border: 1px solid #333; border-radius: 16px; padding: 14px 24px; display: flex; flex-direction: column; gap: 10px; width: 290px; }
     .data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
     .data-label { font-size: 0.78rem; color: #888; align-self: center; }
@@ -532,8 +688,18 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
     <div class="btn" id="btn-ved"  data-cmd="ved">↘</div>
   </div>
   <button id="btn-cart-reset">🎯 Reset Repère Cartésien</button>
-  <button id="btn-escalier">🪜 Lancer Séquence Escalier</button>
   <div class="seq-status">Séquence : <b id="seq-etat">inactive</b></div>
+  <div class="seqgrid">
+    <button class="seqbtn" data-seq="escalier">🪜 Escalier</button>
+    <button class="seqbtn" data-seq="escalier2">🪜 Escalier 2</button>
+    <button class="seqbtn" data-seq="carre">⬛ Carré</button>
+    <button class="seqbtn" data-seq="sequence1">➰ Séquence 1</button>
+    <button class="seqbtn" data-seq="angledroit">📐 Angle droit</button>
+    <button class="seqbtn" data-seq="carresconc">🔲 Carrés conc.</button>
+    <button class="seqbtn" data-seq="carresconc2">🔳 Carrés conc. 2</button>
+    <button class="seqbtn" data-seq="fleche">➤ Flèche</button>
+    <button class="seqbtn stop" id="btn-stop-seq">⏹ STOP séquence</button>
+  </div>
   <div class="cap-box">
     <span class="data-label">🧭 CAP gyro (°)</span>
     <span class="data-val cap" id="cap-val">—</span>
@@ -545,6 +711,9 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
       <span class="data-label">Robot Y</span> <span class="data-val robot" id="rob-y">—</span>
       <span class="data-label">Stylo X</span> <span class="data-val stylo" id="sty-x">—</span>
       <span class="data-label">Stylo Y</span> <span class="data-val stylo" id="sty-y">—</span>
+      <span class="data-label">err Angle</span> <span class="data-val" id="dbg-erra">—</span>
+      <span class="data-label">corr Angle</span> <span class="data-val" id="dbg-corra">—</span>
+      <span class="data-label">corr Dist</span> <span class="data-val" id="dbg-corrd">—</span>
     </div>
   </div>
   <script>
@@ -557,7 +726,10 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
       btn.addEventListener('mouseup', () => { btn.classList.remove('pressed'); send('stop'); });
     });
     document.getElementById('btn-cart-reset').addEventListener('click', () => { fetch('/cartesian/reset'); });
-    document.getElementById('btn-escalier').addEventListener('click', () => { fetch('/sequence/escalier'); });
+    document.querySelectorAll('.seqbtn[data-seq]').forEach(b => {
+      b.addEventListener('click', () => { fetch('/seq?nom=' + b.dataset.seq); });
+    });
+    document.getElementById('btn-stop-seq').addEventListener('click', () => { fetch('/sequence/stop'); });
     setInterval(async () => {
       try {
         const r = await fetch('/pos'); const d = await r.json();
@@ -566,10 +738,12 @@ const char PAGE_HTML[] PROGMEM = R"rawhtml(
         document.getElementById('rob-y').textContent = d.ry.toFixed(1);
         document.getElementById('sty-x').textContent = d.sx.toFixed(1);
         document.getElementById('sty-y').textContent = d.sy.toFixed(1);
+        document.getElementById('dbg-erra').textContent = d.errA.toFixed(3);
+        document.getElementById('dbg-corra').textContent = d.corrA.toFixed(1);
+        document.getElementById('dbg-corrd').textContent = d.corrD.toFixed(1);
         const e = document.getElementById('seq-etat');
-        const b = document.getElementById('btn-escalier');
-        if (d.seq) { e.textContent = 'EN COURS (pt ' + (d.seqpt + 1) + '/' + d.seqn + ')'; b.classList.add('running'); }
-        else { e.textContent = 'inactive'; b.classList.remove('running'); }
+        if (d.seq) { e.textContent = 'EN COURS (pt ' + (d.seqpt + 1) + '/' + d.seqn + ')'; }
+        else { e.textContent = 'inactive'; }
       } catch(e) {}
     }, 150);
   </script>
@@ -609,16 +783,36 @@ void handlePositions() {
 
   char json[220];
   snprintf(json, sizeof(json),
-    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d,\"seqn\":%d}",
-    robX, robY, styX, styY, capDeg, sequenceActive ? 1 : 0, wpIndex, wpCount);
+    "{\"rx\":%.2f,\"ry\":%.2f,\"sx\":%.2f,\"sy\":%.2f,\"cap\":%.1f,\"seq\":%d,\"seqpt\":%d,\"seqn\":%d,\"errA\":%.3f,\"corrA\":%.1f,\"corrD\":%.1f}",
+    robX, robY, styX, styY, capDeg, sequenceActive ? 1 : 0, wpIndex, wpCount, dbgErrA, dbgCorrA, dbgCorrD);
   server.send(200, "application/json", json);
 }
 
 void handleCartesianReset() { reinitialiserRepereCartesien(); server.send(200, "text/plain", "ok"); }
 
-void handleSequenceEscalier() { demarrerSequenceEscalier(); server.send(200, "text/plain", "ok"); }
+void handleSequence() {
+  String nom = server.arg("nom");
+  int id = SEQ_AUCUNE;
+  if      (nom == "escalier")    id = SEQ_ESCALIER;
+  else if (nom == "escalier2")   id = SEQ_ESCALIER2;
+  else if (nom == "carre")       id = SEQ_CARRE;
+  else if (nom == "sequence1")   id = SEQ_SEQUENCE1;
+  else if (nom == "angledroit")  id = SEQ_ANGLEDROIT;
+  else if (nom == "carresconc")  id = SEQ_CARRES_CONC;
+  else if (nom == "carresconc2") id = SEQ_CARRES_CONC2;
+  else if (nom == "fleche")      id = SEQ_FLECHE;
+  if (id == SEQ_AUCUNE) { server.send(400, "text/plain", "inconnue"); return; }
+  seqDemandee = id;               // lue dans loop() -> demarre la sequence
+  server.send(200, "text/plain", "lancee");
+}
+void handleStopSequence() { arreterSequence(); seqDemandee = SEQ_AUCUNE; server.send(200, "text/plain", "stop"); }
 
 void appliquerCommande() {
+  if (commandeEnCours == "reculer" || commandeEnCours == "veg" || commandeEnCours == "ved") {
+    vGseq = -1; vDseq = -1;
+  } else {
+    vGseq = 1; vDseq = 1;
+  }
   if (commandeEnCours == "avancer") {
     digitalWrite(IN_1_D, LOW);  digitalWrite(IN_2_D, HIGH);
     digitalWrite(IN_1_G, HIGH); digitalWrite(IN_2_G, LOW);
@@ -691,7 +885,8 @@ void setup() {
   server.on("/cmd", handleCmd);
   server.on("/pos", handlePositions);
   server.on("/cartesian/reset", handleCartesianReset);
-  server.on("/sequence/escalier", handleSequenceEscalier);
+  server.on("/seq", handleSequence);
+  server.on("/sequence/stop", handleStopSequence);
   server.begin();
 
   Wire.begin(SDA_PIN, SCL_PIN); Wire.setClock(400000);
@@ -713,6 +908,12 @@ void loop() {
   executerFiltreKalman();     // magneto/Kalman : seulement hors sequence (affichage)
   calculerVitesse();
   mettreAJourOdometrie();     // cap gyro + pose (toujours)
+
+  // Demarrage d'une sequence demandee depuis la page web
+  if (seqDemandee != SEQ_AUCUNE && !sequenceActive) {
+    int id = seqDemandee; seqDemandee = SEQ_AUCUNE;
+    demarrerSequence(id);
+  }
 
   if (sequenceActive) {
     gererSequenceEscalier();
