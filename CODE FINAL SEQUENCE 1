@@ -1,0 +1,1841 @@
+// ############################################################################
+//   DRAWBOT  —  robot traceur 2 roues (ESP32)
+//   Fichier unique, reorganise et commente ligne par ligne.
+//   Ordre : includes -> constantes/broches -> declarations -> reglages
+//           -> Moteurs -> Encodeurs/Odometrie -> Capteurs -> Asservissement
+//           -> Trajectoires -> Deplacement -> Sequences -> Communication
+//           -> Reglages serie -> Setup & boucle
+// ############################################################################
+
+
+// ============================================================================
+//   INCLUDES
+// ============================================================================
+#include <Arduino.h>            // fonctions de base Arduino (pinMode, digitalWrite, micros...)
+#include <Wire.h>              // bus I2C (pour l'IMU et le magnetometre)
+#include <SPI.h>              // bus SPI (dependance de certaines libs capteurs)
+#include <Arduino_LSM6DS3.h>    // centrale inertielle LSM6DS3 (accelerometre + gyroscope)
+#include <Adafruit_LIS3MDL.h>   // magnetometre LIS3MDL (boussole)
+#include <Adafruit_Sensor.h>    // couche commune des capteurs Adafruit
+#include <BluetoothSerial.h>    // liaison Bluetooth serie (telecommande / debug)
+
+
+// ============================================================================
+//   CONSTANTES & BROCHES  (cablage de la carte)
+// ============================================================================
+#define LEDU1 25               // LED utilisateur 1
+#define LEDU2 26               // LED utilisateur 2
+
+#define EN_D 23                // broche ENABLE du moteur droit (driver)
+#define EN_G 4                 // broche ENABLE du moteur gauche (driver)
+
+#define IN_1_D 19              // entree 1 du pont en H, moteur droit
+#define IN_2_D 18              // entree 2 du pont en H, moteur droit
+
+#define IN_1_G 17              // entree 1 du pont en H, moteur gauche
+#define IN_2_G 16              // entree 2 du pont en H, moteur gauche
+
+#define ENC_G_CH_A 32          // encodeur gauche, voie A
+#define ENC_G_CH_B 33          // encodeur gauche, voie B
+
+#define ENC_D_CH_A 27          // encodeur droit, voie A
+#define ENC_D_CH_B 14          // encodeur droit, voie B
+
+#define SDA 21                 // broche I2C data
+#define SCL 22                 // broche I2C horloge
+
+#define ADDR_IMU 0x6B          // adresse I2C de la centrale inertielle
+#define ADDR_MAG 0x1E          // adresse I2C du magnetometre
+
+#define SERVO_PIN 12           // broche du servo (leve/baisse stylo)
+#define MICROSWITCH_PIN 15     // broche du microswitch / tirette de depart
+
+#ifndef LED_BUILTIN            // si la carte ne definit pas deja la LED integree
+#define LED_BUILTIN 2          // ... on la fixe sur le GPIO 2
+#endif
+
+#define SENS_AVANT 1           // code "marche avant" pour commanderMoteur()
+#define SENS_ARRIERE 0         // code "marche arriere"
+#define MOTEUR_DROIT 1         // identifiant moteur droit
+#define MOTEUR_GAUCHE 0        // identifiant moteur gauche
+
+#define PWM_MIN 80             // PWM minimum : en dessous la roue ne tourne pas (frottement). 0 reste 0.
+
+#define MMPARPAS 0.06731984257692414082419950107028  // distance parcourue (mm) par pas d'encodeur
+#define DISTANCESTYLO 131.75   // distance (mm) entre le centre du robot et la pointe du stylo
+
+// Codes de figures recus par Bluetooth
+#define RIEN 0                 // aucune figure
+#define POS 1                  // aller a une position
+#define TRAIT 2                // tracer un segment
+#define CERCLE 3               // tracer un cercle
+#define ROSACE 4               // tracer une rosace
+#define COEUR 5                // tracer un coeur
+#define BEUTEU 6               // tracer la figure "beuteu"
+
+// Etats du protocole d'envoi/reception des coordonnees
+#define STPNON 0               // pas d'envoi en cours
+#define STPENENVOI 1           // envoi en cours
+#define STPENVOIFINI 2         // envoi termine
+#define STPPASFINI 3           // envoi non termine
+
+
+// ============================================================================
+//   DECLARATIONS ANTICIPEES  (variables et fonctions utilisees avant leur definition)
+// ============================================================================
+extern Adafruit_LIS3MDL lis3mdl;   // objet magnetometre (defini plus bas)
+extern BluetoothSerial SerialBT;   // objet liaison Bluetooth (defini plus bas)
+
+float normaliserAngle(float angle);                 // ramene un angle dans [-PI, PI]
+void calculerPositionStylo();                       // met a jour la position estimee du stylo
+void enregistrerPoint(float x, float y);            // stocke un point parcouru (debug/trace)
+void commanderMoteur(int sens, int vitesse, int numeroMoteur);  // commande generique d'un moteur
+void commanderMoteurGauche(int vitesse);            // commande moteur gauche (vitesse signee)
+void commanderMoteurDroit(int vitesse);             // commande moteur droit (vitesse signee)
+int  pidAngle(float angleActuel, float angleCible); // PID d'orientation
+int  pidDistance(float input, float consigne);      // PID de distance
+void asservirVersPoint(int consignex, int consigney);   // amene le stylo vers un point
+int  allerAuPoint(int consignex, int consigney);    // bloque jusqu'a atteindre un point (ex-"vasla")
+bool estDansArcDeDisque(float x, float y);          // test geometrique (zone interdite)
+void tracerSegment(float debutx, float debuty, float finx, float finy);              // trace un trait
+void tracerCercle(float cx, float cy, float rayon, float angleDebut, float angleFin);// trace un arc/cercle
+void tracerRosace(float cx, float cy, float rayon);                                  // trace une rosace
+void tracerCoeur(float cx, float cy, float hauteur);                                 // trace un coeur
+void tracerBeuteu(float cx, float cy, float taille);                                 // trace la figure "beuteu"
+void clignoterSansFin();                            // boucle finale : fait clignoter les LED
+void initBroches();                                 // configure les broches (pinMode)
+void initMoteurs();                                 // active les moteurs
+void initialisationComplete();                      // initialisation generale (ex-"toutsetup")
+void allumerLeds();                                 // allume les LED utilisateur
+void tacheCalculPosition(void *parameter);          // tache FreeRTOS : odometrie en continu
+void envoyerCoordonnees();                          // Bluetooth : envoie les points
+void recevoirCoordonnees();                         // Bluetooth : recoit des points
+void traiterCommandeBluetooth();                    // Bluetooth : interprete une commande
+void reglerPidParSerie();                           // ajuste les coefficients PID via le moniteur serie
+void reglerPidParSerieAvecGyro();                   // idem, avec les coefficients du gyroscope
+// Autres prototypes (pour permettre les appels en avant)
+float lireAngleGyroscope();                         // angle de roulis filtre (Kalman)
+int  lireAngleNord();                               // angle vers le nord magnetique
+void calibrerGyroscope();                           // mesure le biais du gyroscope
+void afficherEncodeurs();                           // affiche les compteurs d'encodeurs
+void calculerAngleEtDistanceRoues();                // met a jour angle et distances de roues
+void calculerPositionRobot();                       // met a jour la position du centre robot
+void asservirAngle(float angleCible);               // oriente le robot vers un angle
+void avancerToutDroit(int distance, float angleconsigne);   // avance droit (axe X)
+void avancerToutDroit2(int distance, float angleconsigne);  // avance droit (axe Y, vitesse bridee)
+void tracerN(float x, float y);                     // trace la lettre N
+void tracerBoussole(float rayon, float angle);      // trace une rose des vents
+void allerAPosition(float x, float y);              // rejoint une position (asservissement simple)
+void allerAPosition2(float x, float y);             // calcule l'angle vers une position (debug)
+int  calculerPidGauche(int input, int consigne);    // PID de la roue gauche (vitesse)
+int  calculerPidDroit(int input, int consigne);     // PID de la roue droite (vitesse)
+int  calculerPidGyro(float angleActuel, float angleCible);  // PID base sur le gyroscope
+void asservirAngleSeul(float anglecible);           // maintient un cap via le gyroscope
+void tenirDebout(float angleconsigne);              // securite anti-bascule
+void deplacerRoueGauchePid(int consigne);           // amene la roue gauche a une consigne de pas
+void deplacerRoueDroitePid(int consigne);           // amene la roue droite a une consigne de pas
+void demanderReceptionCoordonnees();                // Bluetooth : demande l'envoi de points
+void afficherListeParametres();                     // Bluetooth : liste les parametres reglables
+void afficherParametresActuels();                   // Bluetooth : affiche les valeurs courantes
+void executerCommande();                            // Bluetooth : execute la figure recue
+void afficherPosition();                            // affiche la position courante (debug)
+void initBluetooth();                               // demarre la liaison Bluetooth
+void initMagnetometre();                            // initialise le magnetometre
+void initCentraleInertielle();                      // initialise l'IMU
+void initBrochesEncodeurs();                         // configure les broches et interruptions encodeurs
+void sequenceCarre();                               // sequence : carre
+void sequenceTest1();                               // sequence : test
+void tracerAngleDroit();                            // sequence : angle droit
+void sequenceEscalier2();                           // sequence : escalier (variante)
+void sequenceCarresConcentriques();                 // sequence : carres concentriques
+void sequenceCarresConcentriques2();                // sequence : carres concentriques (grand)
+void sequenceFleche();                              // sequence : fleche
+
+// Variables globales partagees (declarees ici, definies plus bas dans leur section)
+extern int vitesse;            // vitesse courante (usage generique)
+extern int sens;               // sens courant (usage generique)
+extern long int encG;          // compteur de pas de l'encodeur gauche
+extern long int encD;          // compteur de pas de l'encodeur droit
+extern float angledugyro;      // angle fourni par le gyroscope
+extern float distG;            // distance parcourue par la roue gauche (mm)
+extern float distD;            // distance parcourue par la roue droite (mm)
+extern float robotTheta;       // orientation du robot (non utilise partout)
+extern int nbpoints;           // nombre de points enregistres
+extern long int points[3000][2];   // tableau des points parcourus (x, y)
+extern TaskHandle_t Core0Task; // handle de la tache tournant sur le coeur 0
+extern TaskHandle_t Core1Task; // handle de la tache tournant sur le coeur 1
+extern float rayoncercle;      // rayon courant pour les cercles recus
+extern float angleFin;         // angle de fin courant pour les arcs recus
+extern int recubluetooth;      // type de figure recue par Bluetooth
+extern float bluetoothX, bluetoothY, bluetoothX2, bluetoothY2;  // coordonnees recues
+extern float bluetoothRayon, bluetoothAngleDebut, bluetoothAngleFin;  // parametres recus
+extern double Kp, Ki, Kd;      // coefficients PID generiques
+extern double Setpoint, Input, Output;  // consigne / mesure / sortie generiques
+extern bool variablewifibouton;   // passe a true pour lancer la sequence (commande Bluetooth "99")
+
+
+// ============================================================================
+//   REGLAGES PID  (coefficients et seuils a ajuster selon le robot)
+// ============================================================================
+double KpGyro = 11.5, KiGyro = 0.05, KdGyro = 0.5;   // coefficients PID du gyroscope
+
+double KpDistance = 10.0, KiDistance = 0.0, KdDistance = 14.7;  // PID de distance (avance)
+double KpAngle = 2000.0, KiAngle = 0, KdAngle = 6000;           // PID d'angle (rotation)
+int maxerreurAngle = 26;       // borne de l'erreur d'angle integree
+int maxerreurDistance = 44;    // borne de l'erreur de distance integree
+int maxvitessemoteurangle = 160;   // vitesse moteur max pour la rotation (non utilise au final)
+int tempsdarretfin = 63;       // petite pause (ms) a la fin d'un point atteint
+int maxpidangle = 170;         // sortie max du PID d'angle (autorite en rotation)
+float maxanglediff = 0.2;      // tolerance d'angle (rad) pour considerer l'orientation atteinte
+float mindistancedupoint = 6;  // distance (mm) en dessous de laquelle le point est "atteint"
+float diffmmparpoint = 5;      // pas d'echantillonnage (mm) des trajectoires
+bool debugMode = true;         // active les affichages de debug sur le port serie
+
+
+// ============================================================================
+//   VARIABLES GLOBALES  (definitions regroupees ici, une seule fois)
+// ============================================================================
+Adafruit_LIS3MDL lis3mdl;      // instance du magnetometre (declaree extern plus haut)
+BluetoothSerial SerialBT;      // instance de la liaison Bluetooth (declaree extern plus haut)
+long int points[3000][2];      // tableau des points parcourus (x, y)
+int nbpoints = 0;              // nombre de points enregistres (compteur global)
+float robotX = -DISTANCESTYLO; // position du centre robot en X (le stylo demarre a l'origine)
+float robotY = 0;              // position du centre robot en Y
+float posstyloX = 0;           // position estimee du stylo en X (mm)
+float posstyloY = 0;           // position estimee du stylo en Y (mm)
+bool variablewifi = true;      // drapeau interne (active par la commande serie "2")
+
+
+// ============================================================================
+//   MOTEURS  —  commande bas niveau via le driver (pont en H)
+// ============================================================================
+
+// Commande generique d'un moteur par sens + vitesse + numero (1 = droit, sinon gauche).
+void commanderMoteur(int sens, int vitessemot, int numeroMoteur) {
+  if (numeroMoteur == 1) {                  // si on pilote le moteur droit
+    if (sens == SENS_AVANT) {               // sens avant demande
+      analogWrite(IN_1_D, 0);                // IN1 droite a 0
+      analogWrite(IN_2_D, vitessemot);       // IN2 droite a la vitesse -> avance
+    } else {                                // sinon sens arriere
+      analogWrite(IN_1_D, vitessemot);       // IN1 droite a la vitesse -> recule
+      analogWrite(IN_2_D, 0);                // IN2 droite a 0
+    }
+  } else {                                  // sinon on pilote le moteur gauche
+    if (sens == SENS_AVANT) {               // sens avant demande
+      analogWrite(IN_1_G, vitessemot);       // IN1 gauche a la vitesse -> avance
+      analogWrite(IN_2_G, 0);                // IN2 gauche a 0
+    } else {                                // sinon sens arriere
+      analogWrite(IN_1_G, 0);                // IN1 gauche a 0
+      analogWrite(IN_2_G, vitessemot);       // IN2 gauche a la vitesse -> recule
+    }
+  }
+}
+
+// Pilote le moteur GAUCHE avec une vitesse signee (+ = avant, - = arriere, plage utile +/-255).
+void commanderMoteurGauche(int vitesse) {
+  if (vitesse > 255) vitesse = 255;                        // plafonne a +255 (PWM 8 bits)
+  else if (vitesse < -255) vitesse = -255;                 // plancher a -255
+  if (vitesse > 0 && vitesse < PWM_MIN) vitesse = PWM_MIN;  // force le minimum si commande avant trop faible
+  else if (vitesse < 0 && vitesse > -PWM_MIN) vitesse = -PWM_MIN;  // idem en arriere
+
+  if (vitesse > 0) {                        // vitesse positive -> marche avant
+    analogWrite(IN_1_G, vitesse);            // IN1 gauche recoit le PWM
+    analogWrite(IN_2_G, 0);                  // IN2 gauche a 0
+  } else {                                  // vitesse negative (ou nulle) -> marche arriere
+    analogWrite(IN_1_G, 0);                  // IN1 gauche a 0
+    analogWrite(IN_2_G, -vitesse);           // IN2 gauche recoit la valeur absolue
+  }
+}
+
+// Pilote le moteur DROIT avec une vitesse signee (les broches IN1/IN2 sont inversees vs gauche).
+void commanderMoteurDroit(int vitesse) {
+  if (vitesse > 255) vitesse = 255;                        // plafonne a +255
+  else if (vitesse < -255) vitesse = -255;                 // plancher a -255
+  if (vitesse > 0 && vitesse < PWM_MIN) vitesse = PWM_MIN;  // force le minimum si commande avant trop faible
+  else if (vitesse < 0 && vitesse > -PWM_MIN) vitesse = -PWM_MIN;  // idem en arriere
+
+  if (vitesse > 0) {                        // vitesse positive -> marche avant
+    analogWrite(IN_1_D, 0);                  // IN1 droite a 0
+    analogWrite(IN_2_D, vitesse);            // IN2 droite recoit le PWM
+  } else {                                  // vitesse negative (ou nulle) -> marche arriere
+    analogWrite(IN_1_D, -vitesse);           // IN1 droite recoit la valeur absolue
+    analogWrite(IN_2_D, 0);                  // IN2 droite a 0
+  }
+}
+
+
+// ============================================================================
+//   ENCODEURS & ODOMETRIE  —  mesure du deplacement et estimation de la position
+// ============================================================================
+
+float anglerobot = 0;          // orientation estimee du robot (radians)
+long int encGprec = 0;         // ancienne valeur encodeur gauche (usage interne)
+long int encDprec = 0;         // ancienne valeur encodeur droit (usage interne)
+int lastEncodedG = 0;          // dernier etat (2 bits) des voies de l'encodeur gauche
+int lastEncodedD = 0;          // dernier etat (2 bits) des voies de l'encodeur droit
+
+// Interruption sur l'encodeur GAUCHE : decode la quadrature et incremente/decremente encG.
+void interruptionEncodeurGaucheA() {
+  int MSB = digitalRead(ENC_G_CH_A);        // lit la voie A (bit de poids fort)
+  int LSB = digitalRead(ENC_G_CH_B);        // lit la voie B (bit de poids faible)
+  int encoded = (MSB << 1) | LSB;           // combine les deux voies en un code 2 bits
+  int sum = (lastEncodedG << 2) | encoded;  // concatene ancien et nouvel etat (4 bits)
+
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) encG++;  // sens avant -> +1 (corrige : fix encodeur gauche)
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) encG--;  // sens arriere -> -1
+
+  lastEncodedG = encoded;                   // memorise l'etat pour la prochaine interruption
+}
+
+// Les deux voies declenchent le meme traitement (resolution x4).
+void interruptionEncodeurGaucheB() {
+  interruptionEncodeurGaucheA();            // reutilise le decodage ci-dessus
+}
+
+// Interruption sur l'encodeur DROIT : meme principe, signe oppose (cablage miroir).
+void interruptionEncodeurDroitA() {
+  int MSB = digitalRead(ENC_D_CH_A);        // lit la voie A
+  int LSB = digitalRead(ENC_D_CH_B);        // lit la voie B
+  int encoded = (MSB << 1) | LSB;           // code 2 bits
+  int sum = (lastEncodedD << 2) | encoded;  // ancien + nouvel etat
+
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) encD--;  // sens avant -> -1 (roue droite miroir)
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) encD++;  // sens arriere -> +1
+
+  lastEncodedD = encoded;                   // memorise l'etat
+}
+
+// Idem cote droit pour la voie B.
+void interruptionEncodeurDroitB() {
+  interruptionEncodeurDroitA();             // reutilise le decodage
+}
+
+// Affiche les compteurs d'encodeurs sur le port serie (debug).
+void afficherEncodeurs() {
+  Serial.print("Encodeur gauche : ");       // libelle
+  Serial.print(encG);                       // valeur gauche
+  Serial.print("\tEncodeur droit : ");      // libelle (tabulation)
+  Serial.println(encD);                     // valeur droite + retour ligne
+}
+
+int encGavant2 = 0;            // encodeur gauche au dernier calcul d'odometrie
+int encDavant2 = 0;            // encodeur droit au dernier calcul d'odometrie
+float distGavant2 = 0;         // distance gauche au dernier calcul
+float distDavant2 = 0;         // distance droite au dernier calcul
+float robotXavant = 0;         // ancienne position X (usage interne)
+float robotYavant = 0;         // ancienne position Y (usage interne)
+float anciendistG = 0;         // distance gauche au pas precedent
+float anciendistD = 0;         // distance droite au pas precedent
+float anciendist = 0;          // distance moyenne au pas precedent
+
+// Met a jour l'angle du robot et les distances de roues a partir des encodeurs.
+void calculerAngleEtDistanceRoues(){
+  const float ecartRoues = 80.0;                       // entraxe entre les deux roues (mm)
+  const float facteurAngle = (ecartRoues / MMPARPAS);  // conversion (difference de pas) -> radians
+
+  distG = encG * MMPARPAS;                  // distance totale roue gauche (mm)
+  distD = encD * MMPARPAS;                  // distance totale roue droite (mm)
+
+  float deltaEncG = encG - encGavant2;      // pas gauche depuis le dernier calcul
+  float deltaEncD = encD - encDavant2;      // pas droit depuis le dernier calcul
+  float deltadistG = distG - distGavant2;   // variation de distance gauche (mm)
+  float deltadistD = distD - distDavant2;   // variation de distance droite (mm)
+
+  anglerobot += (deltaEncD - deltaEncG) / facteurAngle;  // rotation = difference des deux roues
+  anglerobot = normaliserAngle(anglerobot); // garde l'angle dans [-PI, PI]
+
+  encGavant2 = encG;                        // memorise pour le prochain calcul
+  encDavant2 = encD;                        // ...
+  distGavant2 = distG;                      // ...
+  distDavant2 = distD;                      // ...
+}
+
+// Met a jour la position (X, Y) du centre du robot par integration du deplacement.
+void calculerPositionRobot(){
+  calculerAngleEtDistanceRoues();           // d'abord l'angle et les distances
+  float nouvelleDistG = distG - anciendistG;// avance gauche depuis le dernier appel
+  float nouvelleDistD = distD - anciendistD;// avance droite depuis le dernier appel
+  anciendistG = distG;                      // memorise
+  anciendistD = distD;                      // memorise
+
+  robotX += (nouvelleDistG + nouvelleDistD) / 2 * cos(anglerobot);  // avance moyenne projetee sur X
+  robotY += (nouvelleDistG + nouvelleDistD) / 2 * sin(anglerobot);  // avance moyenne projetee sur Y
+}
+
+// Calcule la position de la pointe du stylo (decalee de DISTANCESTYLO devant le centre).
+void calculerPositionStylo(){
+  calculerPositionRobot();                  // met d'abord a jour la position du centre
+  posstyloX = robotX + DISTANCESTYLO * cos(anglerobot);  // stylo = centre + offset selon l'orientation
+  posstyloY = robotY + DISTANCESTYLO * sin(anglerobot);  // idem en Y
+}
+
+
+// ============================================================================
+//   CAPTEURS  —  gyroscope (filtre de Kalman sur le roulis) et magnetometre
+// ============================================================================
+
+float kalmanAngleRoll = 0.0;            // estimation Kalman de l'angle de roulis
+float kalmanUncertaintyAngleRoll = 4.0; // incertitude associee a cette estimation
+
+const float gyroMeasurementErrorVariance = 4.0 * 4.0;          // variance d'erreur du gyroscope
+const float accelerometerMeasurementErrorVariance = 3.0 * 3.0; // variance d'erreur de l'accelerometre
+
+float Ax, Ay, Az;              // accelerations lues (3 axes)
+float Gx, Gy, Gz;              // vitesses angulaires lues (3 axes)
+float roll = 0.00;             // angle de roulis courant (degres)
+float gyroRollRate = 0.0;      // vitesse de roulis (non utilise partout)
+float complementaryRoll = 0.0; // variante filtre complementaire (non utilise)
+unsigned long lastRollUpdate = 0;  // horodatage du dernier calcul (us)
+float gyroOffsetX = 0.0;       // biais mesure du gyroscope sur X
+bool isGyroCalibrated = false; // vrai une fois la calibration faite
+
+const float ALPHA = 0.9;       // coefficient de filtre complementaire (si utilise)
+
+// Mesure le biais du gyroscope a l'arret (a appeler robot immobile).
+void calibrerGyroscope() {
+  if (isGyroCalibrated) return;             // ne calibre qu'une seule fois
+
+  Serial.println("Calibration du gyroscope pour Roll...");  // message d'info
+  float sumX = 0.0;                         // accumulateur des mesures
+  int samples = 200;                        // nombre d'echantillons
+
+  for (int i = 0; i < samples; i++) {       // boucle d'acquisition
+    if (IMU.gyroscopeAvailable()) {         // si une nouvelle mesure est dispo
+      IMU.readGyroscope(Gx, Gy, Gz);        // lit les 3 axes
+      sumX += Gx;                           // cumule l'axe X
+      delay(10);                            // attend un peu entre deux mesures
+    }
+  }
+
+  gyroOffsetX = sumX / samples;             // biais = moyenne des mesures a l'arret
+  Serial.print("Offset du gyroscope X: ");  // affiche le biais trouve
+  Serial.println(gyroOffsetX);              // ...
+  isGyroCalibrated = true;                  // marque la calibration comme faite
+}
+
+// Renvoie l'angle de roulis filtre (Kalman), en fusionnant accelerometre et gyroscope.
+float lireAngleGyroscope() {
+  if (!isGyroCalibrated) {                  // si pas encore calibre
+    calibrerGyroscope();                    // ... calibre d'abord
+  }
+
+  unsigned long now = micros();             // temps courant (us)
+  float dt = (now - lastRollUpdate) / 1000000.0f;  // intervalle depuis le dernier calcul (s)
+
+  if (dt > 0.1f || lastRollUpdate == 0) {   // premier appel ou intervalle anormalement long
+    dt = 0.01f;                             // ... on force un pas raisonnable
+  }
+  lastRollUpdate = now;                     // memorise l'horodatage
+
+  if (IMU.accelerationAvailable()) {        // si l'accelerometre a une mesure
+    IMU.readAcceleration(Ax, Ay, Az);       // ... la lire
+  }
+  if (IMU.gyroscopeAvailable()) {           // si le gyroscope a une mesure
+    IMU.readGyroscope(Gx, Gy, Gz);          // ... la lire
+  }
+
+  float correctedGx = Gx - gyroOffsetX;     // retire le biais du gyroscope
+
+  float accelRoll = atan2(Ay, Az) * RAD_TO_DEG;  // roulis deduit de l'accelerometre (degres)
+
+  float predictedAngleRoll = kalmanAngleRoll + dt * correctedGx;  // prediction : angle + integration gyro
+  float predictedUncertaintyAngleRoll = kalmanUncertaintyAngleRoll + dt * dt * gyroMeasurementErrorVariance;  // incertitude predite
+
+  float kalmanGain = predictedUncertaintyAngleRoll / (predictedUncertaintyAngleRoll + accelerometerMeasurementErrorVariance);  // gain de Kalman
+  kalmanAngleRoll = predictedAngleRoll + kalmanGain * (accelRoll - predictedAngleRoll);  // correction par l'accelerometre
+  kalmanUncertaintyAngleRoll = (1.0f - kalmanGain) * predictedUncertaintyAngleRoll;      // mise a jour de l'incertitude
+
+  roll = kalmanAngleRoll;                   // angle de roulis retenu
+  return roll;                              // renvoie l'angle filtre
+}
+
+// Renvoie l'angle vers le nord magnetique (radians) a partir du magnetometre.
+int lireAngleNord(){
+  lis3mdl.read();                           // lit le magnetometre
+
+  float mx = lis3mdl.x;                     // composante X du champ
+  float my = lis3mdl.y;                     // composante Y du champ
+
+  float anglebousole = atan2(my, mx);       // angle de la boussole
+  if (anglebousole < -PI) {                 // recale dans [-PI, PI]
+    anglebousole += 2*PI;                   // ...
+  }
+  if (anglebousole > PI) {                  // ...
+    anglebousole -= 2*PI;                   // ...
+  }
+  return anglebousole;                      // renvoie l'angle (tronque en int)
+}
+
+
+// ============================================================================
+//   ASSERVISSEMENT PID  —  regulateurs distance/angle et pilotage vers un point
+// ============================================================================
+
+float sommeErreursnormal = 0;       // somme des erreurs de distance (terme integral)
+float erreurPrecedentenormal = 0;   // erreur de distance precedente (terme derive)
+
+// PID de DISTANCE : renvoie une commande a partir de l'ecart (consigne - mesure).
+int pidDistance(float Longeur, float consigne_distance) {
+  float erreur = consigne_distance - Longeur;       // ecart a annuler
+
+  float termeP = KpDistance * erreur;               // terme proportionnel
+
+  sommeErreursnormal += erreur;                      // accumule l'erreur (integrale)
+  sommeErreursnormal = constrain(sommeErreursnormal, -maxerreurDistance, maxerreurDistance);  // anti-emballement
+  float termeI = KiDistance * sommeErreursnormal;    // terme integral
+
+  float termeD = KdDistance * (erreur - erreurPrecedentenormal);  // terme derive
+  erreurPrecedentenormal = erreur;                   // memorise pour la prochaine fois
+
+  return (termeP + termeI + termeD);                 // somme des trois termes
+}
+
+float sommeErreursAngle = 0;        // somme des erreurs d'angle (terme integral)
+float erreurPrecedenteAngle = 0;    // erreur d'angle precedente (terme derive)
+
+// PID d'ANGLE : renvoie une correction de rotation a partir de (cible - actuel).
+int pidAngle(float angleActuel, float angleCible) {
+  float erreur = normaliserAngle(angleCible - angleActuel);  // ecart angulaire ramene dans [-PI, PI]
+
+  float termeP = KpAngle * erreur;                  // terme proportionnel
+
+  sommeErreursAngle += erreur;                       // integrale de l'erreur
+  sommeErreursAngle = constrain(sommeErreursAngle, -maxerreurAngle, maxerreurAngle);  // anti-emballement
+  float termeI = KiAngle * sommeErreursAngle;        // terme integral
+
+  float termeD = KdAngle * (erreur - erreurPrecedenteAngle);  // terme derive
+  erreurPrecedenteAngle = erreur;                    // memorise
+
+  return constrain(termeP + termeI + termeD, -maxpidangle, maxpidangle);  // borne la sortie (autorite max)
+}
+
+// Oriente le robot vers un cap donne (n'agit que sur la roue gauche ici, usage debug).
+void asservirAngle(float angleCible) {
+  angleCible = normaliserAngle(angleCible);          // recale la cible
+
+  float angleActuel = normaliserAngle(anglerobot);   // angle courant recale
+
+  float correctionAngle = pidAngle(angleActuel, angleCible);  // correction PID
+  Serial.print("angleActuel : ");                    // debug
+  Serial.print(angleActuel);                         // ...
+  Serial.print("   angleCible : ");                  // ...
+  Serial.print(angleCible);                          // ...
+  Serial.print("   correctionAngle : ");             // ...
+  Serial.println(correctionAngle);                   // ...
+
+  float vitesseGauche = -correctionAngle;            // roue gauche en sens oppose
+  float vitesseDroite = +correctionAngle;            // roue droite dans le sens
+  vitesseGauche = constrain(vitesseGauche, -255, 255);  // borne PWM
+  vitesseDroite = constrain(vitesseDroite, -255, 255);  // borne PWM
+  if (vitesseGauche > 0) {                           // applique a la roue gauche
+    analogWrite(IN_1_G, vitesseGauche);              // avant
+    analogWrite(IN_2_G, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_2_G, -vitesseGauche);             // arriere
+    analogWrite(IN_1_G, 0);                          // ...
+  }
+}
+
+// Coeur de l'asservissement : amene la POINTE DU STYLO vers le point (consignex, consigney).
+void asservirVersPoint(int consignex, int consigney) {
+  float consigne_distance = sqrt(pow(consignex - robotX, 2) + pow(consigney - robotY, 2)) - DISTANCESTYLO;  // distance restante (corrigee de l'offset stylo)
+  float consigne_angle = atan2(consigney - robotY, consignex - robotX);  // cap a viser vers le point
+  float angleActuel = anglerobot;                    // cap courant
+
+  consigne_angle = normaliserAngle(consigne_angle);  // recale la cible
+  angleActuel = normaliserAngle(angleActuel);        // recale l'actuel
+
+  float correctionAngle = pidAngle(angleActuel, consigne_angle);  // correction de rotation
+  constrain(correctionAngle, -maxvitessemoteurangle, maxvitessemoteurangle);  // (borne sans effet : resultat non reutilise)
+
+  bool derriererobot = false;                        // vrai si le point est trop "de cote" pour avancer
+  bool disque = estDansArcDeDisque(consignex,consigney);  // le point est-il dans la zone proche/avant
+  float angleDiff = normaliserAngle(consigne_angle - angleActuel);  // ecart de cap
+  if (abs(angleDiff) > maxanglediff) {               // si le cap n'est pas encore bon
+    derriererobot = true;                            // ... on ne fait d'abord que tourner
+  }
+  if (derriererobot) {                               // tant qu'on doit tourner
+    consigne_distance = 0;                           // ... pas d'avance
+  }
+
+  float correctionDistance = pidDistance(0, consigne_distance);  // correction d'avance
+
+  if (derriererobot && !disque) {                    // si on tourne et que le point n'est pas dans le disque
+    correctionDistance = 0;                          // ... on bloque l'avance
+  }
+
+  if (debugMode){                                    // (emplacement reserve a des affichages de debug)
+
+  }
+
+  delay(4);                                          // petite pause de stabilisation de la boucle
+
+  float vitesseGauche = correctionDistance - correctionAngle;  // melange avance - rotation
+  float vitesseDroite = correctionDistance + correctionAngle;  // melange avance + rotation
+
+  commanderMoteurGauche(vitesseGauche);              // applique a la roue gauche
+  commanderMoteurDroit(vitesseDroite);               // applique a la roue droite
+}
+
+// Avance en ligne droite sur une distance (axe X) tout en maintenant un cap.
+void avancerToutDroit(int distance,float angleconsigne) {
+  float correctionAngle = pidAngle(anglerobot, angleconsigne);  // correction de cap
+  float correctionDistance = pidDistance(robotX, -distance);    // correction d'avance (sur X)
+  Serial.print("correctionAngle : ");                // debug
+  Serial.print(correctionAngle);                     // ...
+  Serial.print("   correctionDistance : ");          // ...
+  Serial.println(correctionDistance);                // ...
+
+  float vitesseGauche = correctionDistance - correctionAngle;  // melange
+  float vitesseDroite = correctionDistance + correctionAngle;  // melange
+  vitesseGauche = constrain(vitesseGauche, -255, 255);  // borne PWM
+  vitesseDroite = constrain(vitesseDroite, -255, 255);  // borne PWM
+  if (vitesseGauche > 0) {                           // roue gauche
+    analogWrite(IN_1_G, vitesseGauche);              // avant
+    analogWrite(IN_2_G, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_2_G, -vitesseGauche);             // arriere
+    analogWrite(IN_1_G, 0);                          // ...
+  }
+  if (vitesseDroite > 0) {                           // roue droite
+    analogWrite(IN_2_D, vitesseDroite);              // avant
+    analogWrite(IN_1_D, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_1_D, -vitesseDroite);             // arriere
+    analogWrite(IN_2_D, 0);                          // ...
+  }
+}
+
+
+// ============================================================================
+//   CALCULS & TRAJECTOIRES  —  geometrie et decoupage des formes en points
+// ============================================================================
+
+// Ramene n'importe quel angle dans l'intervalle [-PI, PI].
+float normaliserAngle(float angle) {
+  while (angle > PI) {                               // tant que trop grand
+    angle -= 2 * PI;                                 // ... retire un tour
+  }
+  while (angle < -PI) {                              // tant que trop petit
+    angle += 2 * PI;                                 // ... ajoute un tour
+  }
+  return angle;                                      // angle recale
+}
+
+// Renvoie vrai si le point vise est proche et a peu pres devant (zone "atteignable directement").
+bool estDansArcDeDisque(float consigneX, float consigneY) {
+  float distanceRobot = sqrt(pow(robotX - consigneX, 2) + pow(robotY - consigneY, 2));  // distance au point
+  float angleconsigne = atan2(consigneY - robotY, consigneX - robotX);  // cap vers le point
+  float anglediff = normaliserAngle(angleconsigne - anglerobot);  // ecart de cap
+
+  if (distanceRobot <= DISTANCESTYLO && abs(anglediff) < 0.4) {  // proche ET a peu pres devant
+    return true;                                     // ... dans la zone
+  }
+  return false;                                      // sinon non
+}
+
+// Trace un segment droit en l'echantillonnant en petits points de diffmmparpoint mm.
+void tracerSegment(float debutx, float debuty, float finx, float finy) {
+  float distance = sqrt(pow(finx - debutx, 2) + pow(finy - debuty, 2));  // longueur du segment
+
+  float distanceentrepoints = diffmmparpoint;        // pas d'echantillonnage (mm)
+  int nbpoints = distance / distanceentrepoints;     // nombre de points intermediaires
+
+  time_t end = millis() + 15000;                     // garde-fou : 15 s max par segment
+  for (int i = 0; i <= nbpoints; i++) {              // pour chaque point du segment
+    float x = debutx + (finx - debutx) * i / nbpoints;  // interpolation lineaire en X
+    float y = debuty + (finy - debuty) * i / nbpoints;  // interpolation lineaire en Y
+    if (millis()>end){                               // si on depasse le temps limite
+      break;                                         // ... on abandonne le segment
+    }
+    allerAuPoint(x, y);                              // rejoint ce point
+  }
+}
+
+// Trace un arc de cercle (centre, rayon, de angleDebut a angleFin).
+void tracerCercle(float centreX, float centreY, float rayon, float angleDebut, float angleFin) {
+  int nbpoints = abs((angleFin - angleDebut) * rayon / diffmmparpoint);  // nb de points selon la longueur d'arc
+
+  for (int i = 0; i <= nbpoints; i++) {              // pour chaque point de l'arc
+    float angle = angleDebut + (angleFin - angleDebut) * i / nbpoints;  // angle courant
+    float x = centreX + rayon * cos(angle);          // position X sur le cercle
+    float y = centreY + rayon * sin(angle);          // position Y sur le cercle
+    allerAuPoint(x, y);                              // rejoint ce point
+  }
+}
+
+// Trace une rosace (courbe en petales, r = rayon * cos(n*angle)).
+void tracerRosace(float centreX, float centreY, float rayon) {
+  int nbpoints = rayon * 2 * PI * 20 / diffmmparpoint;  // densite de points
+
+  const float n = 5;                                 // nombre de petales (parametre de la rosace)
+  for (int i = 0; i <= nbpoints; i++) {              // pour chaque point
+    float angle = i * 2 * PI / nbpoints;             // angle courant (un tour complet)
+    float ro = rayon * cos(n * angle);               // rayon module par cos(n*angle)
+    float x = centreX + ro * cos(angle);             // position X
+    float y = centreY + ro * sin(angle);             // position Y
+    allerAuPoint(x, y);                              // rejoint ce point
+  }
+}
+
+// Trace un coeur (courbe parametrique en coordonnees polaires).
+void tracerCoeur(float centreX, float centreY, float hauteurentrelesdeuxpics) {
+  int nbpoints = 100;                                // nombre de points fixe
+
+  for (int i = 0; i <= nbpoints; i++) {              // pour chaque point
+    float angle = i * PI / nbpoints;                 // angle de 0 a PI
+    float ro = pow(abs(tan(angle)), abs(1/tan(angle)));  // rayon (formule du coeur)
+    float x = centreX + ro * cos(angle) * hauteurentrelesdeuxpics;  // position X mise a l'echelle
+    float y = centreY + ro * sin(angle) * hauteurentrelesdeuxpics;  // position Y mise a l'echelle
+    allerAuPoint(x, y);                              // rejoint ce point
+  }
+}
+
+// Trace la figure "beuteu" (courbe polaire fantaisie).
+void tracerBeuteu(float centreX, float centreY, float taille) {
+  int nbpoints = taille * 2 * PI * 20 / diffmmparpoint;  // densite de points
+
+  for (int i = 0; i <= nbpoints; i++) {              // pour chaque point
+    float angle = i * 2 * PI / nbpoints;             // angle (un tour)
+    float ro = 1.7 - sin(3 * angle) + pow((1 + sin(angle)) / 2, 5) + (cos(4 * angle)) / 2;  // rayon (formule fantaisie)
+    float x = centreX + ro * cos(angle) * taille;    // position X
+    float y = centreY + ro * sin(angle) * taille;    // position Y
+    allerAuPoint(x, y);                              // rejoint ce point
+  }
+}
+
+// Trace un triangle formant un "N" a partir d'un coin (x, y).
+void tracerN(float x, float y){
+  float x1 = x;                                      // coin de depart
+  float y1 = y;                                      // ...
+  float x2 = x + 20;                                 // deuxieme point (en bas a droite)
+  float y2 = y - 40;                                 // ...
+  float x3 = x + 20;                                 // troisieme point (en haut a droite)
+  float y3 = y;                                      // ...
+
+  tracerSegment(x1, y1, x2, y2);                     // cote 1
+  tracerSegment(x2, y2, x3, y3);                     // cote 2
+  tracerSegment(x3, y3, x1, y1);                     // cote 3 (fermeture)
+}
+
+// Trace une rose des vents a 8 branches autour de la position courante du stylo.
+void tracerBoussole(float rayon,float angle){
+  const float rayonduCercle1 = rayon;                // grand rayon
+  const float centrecercle1X = posstyloX;            // centre = position stylo
+  const float centrecercle1Y = posstyloY;            // ...
+  const float rayonduCercle2 = rayon;                // rayon des branches principales
+  const float centreX = posstyloX + rayonduCercle1 * cos(angle);  // centre decale (branche principale)
+  const float centreY = posstyloY + rayonduCercle1 * sin(angle);  // ...
+  const float rayonduCercle3 = rayon * 0.6;          // rayon des branches secondaires
+  const float rayonduCercle4 = rayon * 0.3;          // petit rayon
+
+  float avantX = posstyloX;                          // point de depart des traits
+  float avantY = posstyloY;                          // ...
+
+  const float angleIncrement = PI / 4;               // 45 deg entre branches (8 branches)
+  for (int i = 0; i < 8; i++) {                      // pour chaque branche
+    float angleBranch = angle + i * angleIncrement;  // angle de cette branche
+
+    if (i % 2 == 0) {                                // branches paires (principales)
+      float x1 = centreX + rayonduCercle2 * cos(angleBranch);  // extremite calculee
+      float y1 = centreY + rayonduCercle2 * sin(angleBranch);  // ...
+      float x2 = posstyloX + rayonduCercle1 * cos(angleBranch);  // (valeurs intermediaires)
+      float y2 = posstyloY + rayonduCercle1 * sin(angleBranch);  // ...
+
+      tracerSegment(avantX, avantY, x1, y1);         // trace la branche
+    }
+    else {                                           // branches impaires (secondaires)
+      float x1 = centreX + rayonduCercle3 * cos(angleBranch);  // extremite calculee
+      float y1 = centreY + rayonduCercle3 * sin(angleBranch);  // ...
+      float x2 = posstyloX + rayonduCercle4 * cos(angleBranch);  // ...
+      float y2 = posstyloY + rayonduCercle4 * sin(angleBranch);  // ...
+
+      tracerSegment(avantX, avantY, x1, y1);         // trace la branche
+    }
+  }
+}
+
+
+// ============================================================================
+//   DEPLACEMENT  —  allerAuPoint : bloque jusqu'a ce que le stylo atteigne un point
+// ============================================================================
+
+// Asservit en boucle jusqu'a ce que le stylo soit sur (consignex, consigney), puis arrete.
+int allerAuPoint(int consignex, int consigney) {
+  long tempsdarret = millis();                       // horodatage pour la condition d'arret
+  while (millis() - tempsdarret < tempsdarretfin) {  // tant qu'on n'est pas reste assez longtemps sur la cible
+    Serial.println("Moving...");                     // debug
+
+    calculerPositionStylo();                         // met a jour la position estimee du stylo
+
+    asservirVersPoint(consignex, consigney);         // une iteration de l'asservissement
+    digitalWrite(LEDU2, estDansArcDeDisque(consignex,consigney));  // LED2 : point dans la zone proche
+
+    if (!(abs(posstyloX - consignex) < mindistancedupoint && abs(posstyloY - consigney) < mindistancedupoint)) {  // si pas encore arrive
+      tempsdarret = millis();                        // ... on relance le chrono
+      digitalWrite(LEDU1, LOW);                      // LED1 eteinte (pas arrive)
+    }
+    else{                                            // sinon (dans la tolerance)
+      digitalWrite(LEDU1, HIGH);                     // LED1 allumee (arrive)
+    }
+    delayMicroseconds(10);                           // petite pause de boucle
+  }
+
+  analogWrite(IN_1_G, 0);                            // stoppe la roue gauche
+  analogWrite(IN_2_G, 0);                            // ...
+  analogWrite(IN_1_D, 0);                            // stoppe la roue droite
+  analogWrite(IN_2_D, 0);                            // ...
+
+  return 0;                                          // termine
+}
+
+
+// ============================================================================
+//   SEQUENCES & DESSINS  —  figures pretes a tracer (appeler depuis loop())
+// ============================================================================
+
+// Sequence : un carre de 200 mm (utilise allerAPosition2, surtout pour debug).
+void sequenceCarre(){
+  Serial.println("allerAPosition(2000, 0)");         // debug
+  allerAPosition2(200, 0);                           // coin 1
+
+  delay(1000);                                       // pause
+  Serial.println("allerAPosition(2000, 2000)");      // debug
+  allerAPosition2(0, 0);                             // coin 2
+  delay(1000);                                       // pause
+  Serial.println("allerAPosition(0, 0)");            // debug
+  allerAPosition2(0, 200);                           // coin 3
+  delay(1000);                                       // pause
+  Serial.println("allerAPosition(0, 2000)");         // debug
+  allerAPosition2(200, 200);                         // coin 4
+  delay(1000);                                       // pause
+}
+
+// Sequence de test : quelques points en escalier grossier.
+void sequenceTest1(){
+  allerAuPoint(0, 0);                                // point 1
+  allerAuPoint(400, 0);                              // point 2
+  allerAuPoint(400, 200);                            // point 3
+  allerAuPoint(1000, 200);                           // point 4
+}
+
+// Sequence : un angle droit, point par point (pas de 25 mm).
+void tracerAngleDroit(){
+  allerAuPoint(0, 0);                                // depart
+  allerAuPoint(25, 0);                               // avance en X...
+  allerAuPoint(50, 0);                               // ...
+  allerAuPoint(75, 0);                               // ...
+  allerAuPoint(100, 0);                              // ...
+  allerAuPoint(125, 0);                              // ...
+  allerAuPoint(150, 0);                              // fin de la branche horizontale
+  allerAuPoint(150, 25);                             // monte en Y...
+  allerAuPoint(150, 50);                             // ...
+  allerAuPoint(150, 75);                             // ...
+  allerAuPoint(150, 100);                            // ...
+  allerAuPoint(150, 150);                            // fin de la branche verticale
+}
+
+// Sequence : ESCALIER (une marche) — 15 cm droit, 20 cm cote, 20 cm droit.
+void sequenceEscalier(){
+  tracerSegment(0,0,200,0);                          // trait horizontal
+  tracerSegment(200,0,200,100);                      // trait vertical (la "montee")
+  tracerSegment(200,100,600,100);                    // trait horizontal final
+}
+
+// Sequence : ESCALIER en zigzag (variante a 45 deg).
+void sequenceEscalier2(){
+  tracerSegment(0,0,150,150);                        // diagonale montante
+  tracerSegment(150,150,0,300);                      // diagonale descendante
+  tracerSegment(0,300,150,450);                      // diagonale montante
+}
+
+// Sequence : grands carres concentriques (spirale carree, pas de 45 mm).
+void sequenceCarresConcentriques2(){
+  tracerSegment(0, 0, 450, 0);                       // carre exterieur...
+  tracerSegment(450, 0, 450, 450);                   // ...
+  tracerSegment(450, 450, 0, 450);                   // ...
+  tracerSegment(0, 450, 0, 45);                      // ... puis on rentre d'un cran
+
+  tracerSegment(0, 45, 405, 45);                     // carre suivant...
+  tracerSegment(405, 45, 405, 405);                  // ...
+  tracerSegment(405, 405, 45, 405);                  // ...
+  tracerSegment(45, 405, 45, 90);                    // ...
+
+  tracerSegment(45, 90, 360, 90);                    // ...
+  tracerSegment(360, 90, 360, 360);                  // ...
+  tracerSegment(360, 360, 90, 360);                  // ...
+  tracerSegment(90, 360, 90, 135);                   // ...
+
+  tracerSegment(90, 135, 315, 135);                  // ...
+  tracerSegment(315, 135, 315, 315);                 // ...
+  tracerSegment(315, 315, 135, 315);                 // ...
+  tracerSegment(135, 315, 135, 180);                 // ...
+
+  tracerSegment(135, 180, 270, 180);                 // ...
+  tracerSegment(270, 180, 270, 270);                 // ...
+  tracerSegment(270, 270, 180, 270);                 // ...
+  tracerSegment(180, 270, 180, 207);                 // ...
+
+  tracerSegment(180, 207, 243, 207);                 // ...
+  tracerSegment(243, 207, 243, 243);                 // ...
+  tracerSegment(243, 243, 207, 243);                 // ...
+  tracerSegment(207, 243, 207, 216);                 // ...
+
+  tracerSegment(207, 216, 234, 216);                 // ...
+  tracerSegment(234, 216, 234, 234);                 // ...
+  tracerSegment(234, 234, 216, 234);                 // ...
+  tracerSegment(216, 234, 216, 225);                 // ...
+
+  tracerSegment(216, 225, 225, 225);                 // dernier petit carre central...
+  tracerSegment(225, 225, 225, 234);                 // ...
+  tracerSegment(225, 234, 216, 234);                 // ...
+  tracerSegment(216, 234, 216, 225);                 // ...
+}
+
+// Sequence : petits carres concentriques (pas de 15 mm).
+void sequenceCarresConcentriques(){
+  tracerSegment(0, 0, 90, 0);                        // carre exterieur...
+  tracerSegment(90, 0, 90, 90);                      // ...
+  tracerSegment(90, 90, 0, 90);                      // ...
+  tracerSegment(0, 90, 0, 15);                       // ... on rentre d'un cran
+
+  tracerSegment(0, 15, 75, 15);                      // carre suivant...
+  tracerSegment(75, 15, 75, 75);                     // ...
+  tracerSegment(75, 75, 15, 75);                     // ...
+  tracerSegment(15, 75, 15, 30);                     // ...
+
+  tracerSegment(15, 30, 60, 30);                     // ...
+  tracerSegment(60, 30, 60, 60);                     // ...
+  tracerSegment(60, 60, 30, 60);                     // ...
+  tracerSegment(30, 60, 30, 39);                     // ...
+
+  tracerSegment(30, 39, 51, 39);                     // dernier carre central...
+  tracerSegment(51, 39, 51, 51);                     // ...
+  tracerSegment(51, 51, 39, 51);                     // ...
+}
+
+// Sequence : la figure "beuteu" composee de cercles et de traits.
+void sequenceBeuteu(){
+  tracerCercle(0, 30, 30, -PI/2, 3*PI/2);            // boucle haute
+  tracerCercle(0, -30, 30, PI/2, -4*PI/2);           // boucle basse
+  tracerSegment(30, -30, 150, -30);                  // trait du bas
+  tracerCercle(150, 0, 30, -PI/2, 0);                // quart de cercle droit (bas)
+  tracerSegment(150+30, 0, 150+10, 0);               // petit aller
+  tracerSegment(150+10, 0, 150+30, 0);               // petit retour
+  tracerCercle(150, 0, 30, 0, PI/2);                 // quart de cercle droit (haut)
+  tracerSegment(150, 30, 150, -30);                  // trait vertical (aller)
+  tracerSegment(150, -30, 150, 30);                  // trait vertical (retour)
+  tracerSegment(150, 30, 0, 30);                     // trait du haut
+}
+
+// Enregistre un point parcouru dans le tableau (buffer circulaire de 3000 points).
+void enregistrerPoint(float x, float y) {
+  points[nbpoints][0] = x;                           // stocke X
+  points[nbpoints][1] = y;                           // stocke Y
+  nbpoints++;                                        // avance l'index
+  if (nbpoints >= 3000) {                            // si le tableau est plein
+    nbpoints = 0;                                    // ... on repart au debut
+  }
+}
+
+
+// ============================================================================
+//   COMMUNICATION  —  reglages PID par serie/Bluetooth et echange de coordonnees
+// ============================================================================
+
+// Lit le moniteur SERIE et met a jour les coefficients PID (format "1 Kp Ki Kd Setpoint").
+void reglerPidParSerie() {
+  if (Serial.available() > 0) {                      // si une ligne est dispo
+    String input = Serial.readStringUntil('\n');     // lit la ligne
+    input.trim();                                    // enleve espaces/retours
+
+    char mode = input.charAt(0);                     // 1er caractere = mode (1 angle / 0 distance)
+    input = input.substring(1);                      // le reste = les valeurs
+
+    float newKp, newKi, newKd, newSetpoint;          // valeurs lues
+    int parsed = sscanf(input.c_str(), "%f %f %f %f", &newKp, &newKi, &newKd, &newSetpoint);  // parse 4 nombres
+
+    if (parsed == 4) {                               // si les 4 valeurs sont presentes
+      if (mode == '1') {                             // mode angle
+        KpAngle = newKp;                             // applique
+        KiAngle = newKi;                             // ...
+        KdAngle = newKd;                             // ...
+        Setpoint = newSetpoint;                      // ...
+
+        Serial.println("Coefficients PID pour l'angle mis à jour :");  // accuse de reception
+        Serial.print("KpAngle = ");                  // ...
+        Serial.println(KpAngle);                     // ...
+        Serial.print("KiAngle = ");                  // ...
+        Serial.println(KiAngle);                     // ...
+        Serial.print("KdAngle = ");                  // ...
+        Serial.println(KdAngle);                     // ...
+        Serial.print("Setpoint = ");                 // ...
+        Serial.println(Setpoint);                    // ...
+      } else if (mode == '0') {                      // mode distance
+        KpDistance = newKp;                          // applique
+        KiDistance = newKi;                          // ...
+        KdDistance = newKd;                          // ...
+        Setpoint = newSetpoint;                      // ...
+
+        Serial.println("Coefficients PID pour la distance mis à jour :");  // accuse de reception
+        Serial.print("KpDistance = ");               // ...
+        Serial.println(KpDistance);                  // ...
+        Serial.print("KiDistance = ");               // ...
+        Serial.println(KiDistance);                  // ...
+        Serial.print("KdDistance = ");               // ...
+        Serial.println(KdDistance);                  // ...
+        Serial.print("Setpoint = ");                 // ...
+        Serial.println(Setpoint);                    // ...
+      }
+      else if (mode == '2') {                        // mode 2 : demande de demarrage
+        variablewifi = true;                         // ...
+      }else {                                        // mode inconnu
+        Serial.println("Erreur : Le premier caractère doit être '1' (angle) ou '0' (distance).");  // message
+      }
+    } else {                                         // mauvais format
+      Serial.println("Erreur : Entrez les valeurs sous la forme '1 Kp Ki Kd Setpoint' ou '0 Kp Ki Kd Setpoint'");  // aide
+    }
+  }
+}
+
+// Variante du reglage PID lue cette fois depuis le BLUETOOTH (et coefficients gyro).
+void reglerPidParSerieAvecGyro() {
+  if (Serial.available() > 0) {                      // si donnee dispo cote serie
+    String input = SerialBT.readStringUntil('\n');   // ... mais lecture cote Bluetooth
+    input.trim();                                    // nettoie
+
+    char mode = input.charAt(0);                     // mode
+    input = input.substring(1);                      // valeurs
+
+    float newKp, newKi, newKd, newSetpoint;          // valeurs lues
+    int parsed = sscanf(input.c_str(), "%f %f %f %f", &newKp, &newKi, &newKd, &newSetpoint);  // parse
+
+    if (parsed == 4) {                               // 4 valeurs
+      if (mode == '1') {                             // mode angle
+        KpAngle = newKp;                             // applique
+        KiAngle = newKi;                             // ...
+        KdAngle = newKd;                             // ...
+        Setpoint = newSetpoint;                      // ...
+
+        SerialBT.println("Coefficients PID pour l'angle mis à jour :");  // accuse (Bluetooth)
+        SerialBT.print("KpAngle = ");                // ...
+        SerialBT.println(KpAngle);                   // ...
+        SerialBT.print("KiAngle = ");                // ...
+        SerialBT.println(KiAngle);                   // ...
+        SerialBT.print("KdAngle = ");                // ...
+        SerialBT.println(KdAngle);                   // ...
+        SerialBT.print("Setpoint = ");               // ...
+        SerialBT.println(Setpoint);                  // ...
+      } else if (mode == '0') {                      // mode distance
+        KpDistance = newKp;                          // applique
+        KiDistance = newKi;                          // ...
+        KdDistance = newKd;                          // ...
+        Setpoint = newSetpoint;                      // ...
+
+        SerialBT.println("Coefficients PID pour la distance mis à jour :");  // accuse
+        SerialBT.print("KpDistance = ");             // ...
+        SerialBT.println(KpDistance);                // ...
+        SerialBT.print("KiDistance = ");             // ...
+        SerialBT.println(KiDistance);                // ...
+        SerialBT.print("KdDistance = ");             // ...
+        SerialBT.println(KdDistance);                // ...
+        SerialBT.print("Setpoint = ");               // ...
+        SerialBT.println(Setpoint);                  // ...
+      }
+      else if (mode == '2') {                        // mode 2
+        variablewifi = true;                         // demande de demarrage
+      }else {                                        // mode inconnu
+        SerialBT.println("Erreur : Le premier caractère doit être '1' (angle) ou '0' (distance).");  // message
+      }
+    } else {                                         // mauvais format
+      SerialBT.println("Erreur : Entrez les valeurs sous la forme '1 Kp Ki Kd Setpoint' ou '0 Kp Ki Kd Setpoint'");  // aide
+    }
+  }
+}
+
+// Affiche la position courante (angle, stylo, centre robot) sur le port serie.
+void afficherPosition(){
+  Serial.print("Angle : ");                          // libelle
+  Serial.print(anglerobot);                          // angle robot
+  Serial.print("\tposx : ");                         // ...
+  Serial.print(posstyloX);                           // X stylo
+  Serial.print("\tposy : ");                         // ...
+  Serial.print(posstyloY);                           // Y stylo
+  Serial.print("\tRX : ");                           // ...
+  Serial.print(robotX);                              // X centre robot
+  Serial.print("\tRY : ");                           // ...
+  Serial.println(robotY);                            // Y centre robot
+}
+
+int stpenvoi = STPNON;                               // etat du protocole d'envoi de coordonnees
+
+// Demarre la liaison Bluetooth (nom "LAPIN").
+void initBluetooth() {
+  #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+#if !defined(CONFIG_BT_SPP_ENABLED)
+#error Serial Port Profile for Bluetooth is not available or not enabled. It is only available for the ESP32 chip.
+#endif
+  SerialBT.begin("LAPIN");                           // demarre le Bluetooth sous le nom "LAPIN"
+  Serial.println("Bluetooth démarré");               // message
+}
+
+// Envoie la position courante du stylo via Bluetooth (format "P: x y").
+void envoyerCoordonnees() {
+  calculerPositionStylo();                           // met a jour la position
+  if (stpenvoi == STPENENVOI) {                      // si un envoi est deja en cours
+    Serial.println("Envoi des coordonnées annulé");  // ... on annule
+    return;                                          // ...
+  }
+  SerialBT.print("P: ");                             // entete
+  SerialBT.print(posstyloX);                         // X
+  SerialBT.print(" ");                               // separateur
+  SerialBT.println(posstyloY);                       // Y
+  if (stpenvoi == STPENENVOI) {                      // garde-fou
+    stpenvoi = STPPASFINI;                           // ...
+    Serial.println("oups");                          // ...
+  }
+}
+
+// Demande au correspondant Bluetooth d'envoyer des points (envoie "STP").
+void demanderReceptionCoordonnees() {
+  recubluetooth = RIEN;                              // remet le type de figure a "rien"
+  stpenvoi = STPENENVOI;                             // marque l'envoi en cours
+  SerialBT.flush();                                  // vide le tampon
+  SerialBT.println();                                // ligne vide
+  SerialBT.println("STP");                           // commande "STP"
+  Serial.println("Demande de coordonnées envoyée");  // debug
+  if (stpenvoi == STPPASFINI) {                      // si l'envoi precedent a echoue
+    Serial.println("Pas bien envoyé");               // ... on reessaie
+    SerialBT.flush();                                // ...
+    SerialBT.println();                              // ...
+    SerialBT.println("STP");                         // ...
+  }
+  stpenvoi = STPENVOIFINI;                           // marque l'envoi termine
+}
+
+float bluetoothX = 0;                                // X recu par Bluetooth
+float bluetoothY = 0;                                // Y recu
+float bluetoothX2 = 0;                               // X2 recu (pour un trait)
+float bluetoothY2 = 0;                               // Y2 recu
+float bluetoothRayon = 0;                            // rayon recu (cercle/rosace)
+float bluetoothAngleDebut = 0;                       // angle de debut recu (cercle)
+float bluetoothAngleFin = 0;                         // angle de fin recu (cercle)
+int recubluetooth = 0;                               // type de figure recue (POS/TRAIT/CERCLE/...)
+
+// Lit une trame Bluetooth et remplit les variables selon le type (P:/T:/C:/R:).
+void recevoirCoordonnees() {
+  if (SerialBT.available()) {                        // si une trame est dispo
+    String data = SerialBT.readStringUntil('\n');    // lit la ligne
+    Serial.println("Données reçues : " + data);      // debug
+
+    if (data.startsWith("P:")) {                     // ----- une POSITION -----
+      recubluetooth = POS;                           // type = position
+
+      int indexEspace = data.indexOf(' ');           // cherche l'espace separateur
+      if (indexEspace != -1) {                       // si trouve
+        String xString = data.substring(2, indexEspace);  // sous-chaine X
+        String yString = data.substring(indexEspace + 1);  // sous-chaine Y
+        float x = xString.toFloat();                 // convertit X
+        float y = yString.toFloat();                 // convertit Y
+        Serial.println("Coordonnées reçues : " + String(x) + ", " + String(y));  // debug
+        SerialBT.println("MERCI");                   // acquittement
+        Serial.println("MERCI envoye");              // debug
+        bluetoothX = x;                              // stocke X
+        bluetoothY = y;                              // stocke Y
+      }
+      else {                                         // pas d'espace -> invalide
+        Serial.println("Données non valides pour les coordonnées");  // debug
+        SerialBT.println("ERR");                     // erreur
+      }
+    }
+    else if (data.startsWith("T:")){                 // ----- un TRAIT (2 points) -----
+      recubluetooth = TRAIT;                         // type = trait
+
+      int indexEspace1 = data.indexOf(' ', 2);       // 1er espace
+      int indexEspace2 = data.indexOf(' ', indexEspace1 + 1);  // 2e espace
+      int indexEspace3 = data.indexOf(' ', indexEspace2 + 1);  // 3e espace
+      if (indexEspace1 != -1 && indexEspace2 != -1 && indexEspace3 != -1) {  // si 3 espaces
+        String xString = data.substring(2, indexEspace1);              // X
+        String yString = data.substring(indexEspace1 + 1, indexEspace2);   // Y
+        String x2String = data.substring(indexEspace2 + 1, indexEspace3);  // X2
+        String y2String = data.substring(indexEspace3 + 1);            // Y2
+        float x = xString.toFloat();                 // convertit X
+        float y = yString.toFloat();                 // convertit Y
+        float x2 = x2String.toFloat();               // convertit X2
+        float y2 = y2String.toFloat();               // convertit Y2
+        Serial.println("Coordonnées reçues : " + String(x) + ", " + String(y) + ", " + String(x2) + ", " + String(y2));  // debug
+        SerialBT.println("MERCI");                   // acquittement
+        Serial.println("MERCI envoye");              // debug
+        bluetoothX = x;                              // stocke
+        bluetoothY = y;                              // ...
+        bluetoothX2 = x2;                            // ...
+        bluetoothY2 = y2;                            // ...
+      }
+      else{                                          // format invalide
+        Serial.println("Données non valides pour le trait");  // debug
+        SerialBT.println("ERR");                     // erreur
+      }
+    }
+    else if (data.startsWith("C:")){                 // ----- un CERCLE (5 parametres) -----
+      recubluetooth = CERCLE;                        // type = cercle
+
+      int indexEspace1 = data.indexOf(' ', 2);       // espaces separateurs...
+      int indexEspace2 = data.indexOf(' ', indexEspace1 + 1);  // ...
+      int indexEspace3 = data.indexOf(' ', indexEspace2 + 1);  // ...
+      int indexEspace4 = data.indexOf(' ', indexEspace3 + 1);  // ...
+      if (indexEspace1 != -1 && indexEspace2 != -1 && indexEspace3 != -1 && indexEspace4 != -1) {  // si 4 espaces
+        String xString = data.substring(2, indexEspace1);                  // X
+        String yString = data.substring(indexEspace1 + 1, indexEspace2);   // Y
+        String rayonString = data.substring(indexEspace2 + 1, indexEspace3);       // rayon
+        String angleDebutString = data.substring(indexEspace3 + 1, indexEspace4);  // angle debut
+        String angleFinString = data.substring(indexEspace4 + 1);          // angle fin
+        float x = xString.toFloat();                 // conversions...
+        float y = yString.toFloat();                 // ...
+        float rayon = rayonString.toFloat();         // ...
+        float angleDebut = angleDebutString.toFloat();  // ...
+        float angleFin = angleFinString.toFloat();   // ...
+        Serial.println("Coordonnées reçues : " + String(x) + ", " + String(y) + ", " + String(rayon) + ", " + String(angleDebut) + ", " + String(angleFin));  // debug
+        SerialBT.println("MERCI");                   // acquittement
+        Serial.println("MERCI envoye");              // debug
+
+        bluetoothX = x;                              // stocke
+        bluetoothY = y;                              // ...
+        bluetoothRayon = rayon;                      // ...
+        bluetoothAngleDebut = angleDebut;            // ...
+        bluetoothAngleFin = angleFin;                // ...
+      }
+      else{                                          // format invalide
+        Serial.println("Données non valides pour le cercle");  // debug
+        SerialBT.println("ERR");                     // erreur
+      }
+    }
+    else if (data.startsWith("R:")){                 // ----- une ROSACE (3 parametres) -----
+      recubluetooth = ROSACE;                        // type = rosace
+
+      int indexEspace1 = data.indexOf(' ', 2);       // espaces...
+      int indexEspace2 = data.indexOf(' ', indexEspace1 + 1);  // ...
+      if (indexEspace1 != -1 && indexEspace2 != -1) {  // si 2 espaces
+        String xString = data.substring(2, indexEspace1);              // X
+        String yString = data.substring(indexEspace1 + 1, indexEspace2);   // Y
+        String rayonString = data.substring(indexEspace2 + 1);         // rayon
+        float x = xString.toFloat();                 // conversions...
+        float y = yString.toFloat();                 // ...
+        float rayon = rayonString.toFloat();         // ...
+        Serial.println("Coordonnées reçues : " + String(x) + ", " + String(y) + ", " + String(rayon));  // debug
+        SerialBT.println("MERCI");                   // acquittement
+        Serial.println("MERCI envoye");              // debug
+
+        bluetoothX = x;                              // stocke
+        bluetoothY = y;                              // ...
+        bluetoothRayon = rayon;                      // ...
+      }
+      else{                                          // format invalide
+        Serial.println("Données non valides pour la rosace");  // debug
+        SerialBT.println("ERR");                     // erreur
+      }
+    }
+    else{                                            // entete inconnue
+      Serial.println("Données non valides");         // debug
+      SerialBT.println("ERR");                       // erreur
+    }
+  }
+}
+
+time_t lastRequestTime = 0;                          // horodatage de la derniere demande de points
+
+// Boucle d'execution Bluetooth : selon la figure recue, lance le trace correspondant.
+void executerCommande() {
+  switch (recubluetooth) {                           // selon le type recu
+    case RIEN:{                                      // rien recu
+      recevoirCoordonnees();                         // ... on tente de recevoir
+
+      time_t currentTime = millis();                 // temps courant
+      if (currentTime - lastRequestTime > 1000) {    // toutes les secondes
+        demanderReceptionCoordonnees();              // ... on redemande des points
+        lastRequestTime = currentTime;               // ...
+      }
+      break;}
+    case POS:                                        // une position
+      Serial.println("Faire la trajectoire avec les coordonnées reçues");  // debug
+      allerAuPoint(bluetoothX, bluetoothY);          // rejoint le point
+      demanderReceptionCoordonnees();                // redemande
+      break;
+    case TRAIT:                                      // un trait
+      Serial.println("Faire le trait avec les coordonnées reçues");  // debug
+      tracerSegment(bluetoothX, bluetoothY, bluetoothX2, bluetoothY2);  // trace le trait
+      demanderReceptionCoordonnees();                // redemande
+      break;
+    case CERCLE:                                     // un cercle
+      Serial.println("Faire le cercle avec les coordonnées reçues");  // debug
+      tracerCercle(bluetoothX, bluetoothY, bluetoothRayon, bluetoothAngleDebut, bluetoothAngleFin);  // trace
+      demanderReceptionCoordonnees();                // redemande
+      break;
+    case ROSACE:                                     // une rosace
+      Serial.println("Faire la rosace avec les coordonnées reçues");  // debug
+      tracerRosace(bluetoothX, bluetoothY, bluetoothRayon);  // trace
+      demanderReceptionCoordonnees();                // redemande
+      break;
+    default:                                         // cas non gere
+      demanderReceptionCoordonnees();                // redemande
+      delay(1000);                                   // attend
+      recevoirCoordonnees();                         // tente de recevoir
+      break;
+  }
+}
+
+// Affiche par Bluetooth la liste des parametres reglables a distance.
+void afficherListeParametres() {
+  SerialBT.println("\n=== LISTE DES PARAMÈTRES ===");                          // titre
+  SerialBT.println("1: KpDistance - PID proportionnel pour la distance");      // ...
+  SerialBT.println("2: KiDistance - PID intégral pour la distance");           // ...
+  SerialBT.println("3: KdDistance - PID dérivé pour la distance");             // ...
+  SerialBT.println("4: KpAngle - PID proportionnel pour l'angle");             // ...
+  SerialBT.println("5: KiAngle - PID intégral pour l'angle");                  // ...
+  SerialBT.println("6: KdAngle - PID dérivé pour l'angle");                    // ...
+  SerialBT.println("7: maxerreurAngle - Erreur d'angle maximale");             // ...
+  SerialBT.println("8: maxerreurDistance - Erreur de distance maximale");      // ...
+  SerialBT.println("9: maxvitessemoteurangle - Vitesse maximale du commanderMoteur pour l'angle");  // ...
+  SerialBT.println("10: tempsdarretfin - Temps d'arrêt à la fin (ms)");        // ...
+  SerialBT.println("11: maxpidangle - Sortie PID maximale pour l'angle");      // ...
+  SerialBT.println("12: maxanglediff - Différence d'angle maximale autorisée");// ...
+  SerialBT.println("13: mindistancedupoint - Distance minimale au point");     // ...
+  SerialBT.println("14: diffmmparpoint - Différence entre les moteurs");       // ...
+  SerialBT.println("15: rayoncercle - Rayon du cercle");                       // ...
+  SerialBT.println("16: angleFin - Angle final pour le cercle");               // ...
+  SerialBT.println("99: Démarrer la séquence");                                // ...
+  SerialBT.println("'aide' ou '?' pour afficher cette liste");                 // ...
+  SerialBT.println("'statut' pour afficher les valeurs actuelles");            // ...
+}
+
+// Affiche par Bluetooth la valeur actuelle de chaque parametre.
+void afficherParametresActuels() {
+  SerialBT.println("\n=== PARAMÈTRES ACTUELS ===");                  // titre
+  SerialBT.println("1: KpDistance = " + String(KpDistance));        // ...
+  SerialBT.println("2: KiDistance = " + String(KiDistance));        // ...
+  SerialBT.println("3: KdDistance = " + String(KdDistance));        // ...
+  SerialBT.println("4: KpAngle = " + String(KpAngle));              // ...
+  SerialBT.println("5: KiAngle = " + String(KiAngle));              // ...
+  SerialBT.println("6: KdAngle = " + String(KdAngle));              // ...
+  SerialBT.println("7: maxerreurAngle = " + String(maxerreurAngle));        // ...
+  SerialBT.println("8: maxerreurDistance = " + String(maxerreurDistance));  // ...
+  SerialBT.println("9: maxvitessemoteurangle = " + String(maxvitessemoteurangle));  // ...
+  SerialBT.println("10: tempsdarretfin = " + String(tempsdarretfin));       // ...
+  SerialBT.println("11: maxpidangle = " + String(maxpidangle));            // ...
+  SerialBT.println("12: maxanglediff = " + String(maxanglediff));          // ...
+  SerialBT.println("13: mindistancedupoint = " + String(mindistancedupoint));  // ...
+  SerialBT.println("14: diffmmparpoint = " + String(diffmmparpoint));      // ...
+  SerialBT.println("15: rayoncercle = " + String(rayoncercle));            // ...
+  SerialBT.println("16: angleFin = " + String(angleFin));                  // ...
+}
+
+// Interprete une commande Bluetooth "<numero> <valeur>" et modifie le parametre correspondant.
+void traiterCommandeBluetooth() {
+  if (SerialBT.available()) {                        // si une commande arrive
+    String commande = SerialBT.readStringUntil('\n');// lit la ligne
+    commande.trim();                                 // nettoie
+
+    int indexEspace = commande.indexOf(' ');         // cherche l'espace
+    if (indexEspace > 0) {                           // forme "<num> <valeur>"
+      int numParam = commande.substring(0, indexEspace).toInt();   // numero du parametre
+      float valeur = commande.substring(indexEspace + 1).toFloat();// valeur
+
+      switch (numParam) {                            // selon le parametre
+        case 1:                                      // KpDistance
+          KpDistance = valeur;                       // applique
+          SerialBT.println("KpDistance mis à jour à " + String(valeur));  // accuse
+          break;
+        case 2:                                      // KiDistance
+          KiDistance = valeur;                       // applique
+          SerialBT.println("KiDistance mis à jour à " + String(valeur));  // accuse
+          break;
+        case 3:                                      // KdDistance
+          KdDistance = valeur;                       // applique
+          SerialBT.println("KdDistance mis à jour à " + String(valeur));  // accuse
+          break;
+        case 4:                                      // KpAngle
+          KpAngle = valeur;                          // applique
+          SerialBT.println("KpAngle mis à jour à " + String(valeur));     // accuse
+          break;
+        case 5:                                      // KiAngle
+          KiAngle = valeur;                          // applique
+          SerialBT.println("KiAngle mis à jour à " + String(valeur));     // accuse
+          break;
+        case 6:                                      // KdAngle
+          KdAngle = valeur;                          // applique
+          SerialBT.println("KdAngle mis à jour à " + String(valeur));     // accuse
+          break;
+        case 7:                                      // maxerreurAngle
+          maxerreurAngle = (int)valeur;              // applique (entier)
+          SerialBT.println("maxerreurAngle mis à jour à " + String((int)valeur));  // accuse
+          break;
+        case 8:                                      // maxerreurDistance
+          maxerreurDistance = (int)valeur;           // applique
+          SerialBT.println("maxerreurDistance mis à jour à " + String((int)valeur));  // accuse
+          break;
+        case 9:                                      // maxvitessemoteurangle
+          maxvitessemoteurangle = (int)valeur;       // applique
+          SerialBT.println("maxvitessemoteurangle mis à jour à " + String((int)valeur));  // accuse
+          break;
+        case 10:                                     // tempsdarretfin
+          tempsdarretfin = (int)valeur;              // applique
+          SerialBT.println("tempsdarretfin mis à jour à " + String((int)valeur));  // accuse
+          break;
+        case 11:                                     // maxpidangle
+          maxpidangle = (int)valeur;                 // applique
+          SerialBT.println("maxpidangle mis à jour à " + String((int)valeur));  // accuse
+          break;
+        case 12:                                     // maxanglediff
+          maxanglediff = valeur;                     // applique
+          SerialBT.println("maxanglediff mis à jour à " + String(valeur));  // accuse
+          break;
+        case 13:                                     // mindistancedupoint
+          mindistancedupoint = valeur;               // applique
+          SerialBT.println("mindistancedupoint mis à jour à " + String(valeur));  // accuse
+          break;
+        case 14:                                     // diffmmparpoint
+          diffmmparpoint = valeur;                   // applique
+          SerialBT.println("diffmmparpoint mis à jour à " + String(valeur));  // accuse
+          break;
+        case 15:                                     // rayoncercle
+          rayoncercle = valeur;                      // applique
+          SerialBT.println("rayoncercle mis à jour à " + String(valeur));  // accuse
+          break;
+        case 16:                                     // angleFin
+          angleFin = valeur;                         // applique
+          SerialBT.println("angleFin mis à jour à " + String(valeur));  // accuse
+          break;
+        case 17:                                     // debugMode
+          debugMode = valeur > 0;                    // active/desactive le debug
+          SerialBT.println("Mode debug " + String(debugMode ? "activé" : "désactivé"));  // accuse
+          break;
+        case 99:                                     // demarrage de la sequence
+          variablewifibouton = true;                 // ... met le drapeau a true
+          SerialBT.println("Démarrage de la séquence !");  // accuse
+          break;
+        default:                                     // numero inconnu
+          SerialBT.println("Numéro de paramètre inconnu");  // message
+      }
+    } else if (commande == "aide" || commande == "?") {  // demande d'aide
+      afficherListeParametres();                     // ... affiche la liste
+    } else if (commande == "statut") {               // demande de statut
+      afficherParametresActuels();                   // ... affiche les valeurs
+    }
+    else {                                           // commande non reconnue
+      SerialBT.println("Format de commande invalide. Utilisez '<numéro> <valeur>' (ex: '1 0.5')");  // aide
+      SerialBT.println("Ou tapez 'aide' pour la liste des paramètres, 'statut' pour les valeurs actuelles");  // aide
+    }
+  }
+}
+
+
+// ============================================================================
+//   UTILITAIRES & DEPLACEMENTS ALTERNATIFS  (LEDs, PID de roue, deplacements simples)
+// ============================================================================
+
+// Boucle finale infinie : fait clignoter les deux LED (signale "fini").
+void clignoterSansFin(){
+  digitalWrite(LEDU1, LOW);                          // une LED eteinte
+  digitalWrite(LEDU2, HIGH);                         // l'autre allumee
+  while(1) {                                         // boucle sans fin
+    delay(200);                                      // attend 200 ms
+    digitalWrite(LEDU1, !digitalRead(LEDU1));        // inverse LED1
+    digitalWrite(LEDU2, !digitalRead(LEDU2));        // inverse LED2
+  }
+}
+
+// Allume les deux LED utilisateur.
+void allumerLeds() {
+  digitalWrite(LEDU1, HIGH);                         // LED1 allumee
+  digitalWrite(LEDU2, HIGH);                         // LED2 allumee
+}
+
+double outputgauche = 0;                             // sortie du PID de roue gauche
+double outputdroite = 0;                             // sortie du PID de roue droite
+
+// Amene la roue GAUCHE a une consigne (en pas/10) via un PID de vitesse.
+void deplacerRoueGauchePid(int consigne) {
+  outputgauche = calculerPidGauche(encG/10, consigne);  // calcule la commande
+  Serial.print("outputgauche : ");                   // debug
+  Serial.println(outputgauche);                      // ...
+
+  outputgauche = constrain(outputgauche, -255, 255); // borne PWM
+  if (outputgauche > 0) {                            // sens avant
+    analogWrite(IN_1_G, outputgauche);               // ...
+    analogWrite(IN_2_G, 0);                          // ...
+  } else {                                           // sens arriere
+    analogWrite(IN_2_G, -outputgauche);              // ...
+    analogWrite(IN_1_G, 0);                          // ...
+  }
+}
+
+// Amene la roue DROITE a une consigne (en pas/10) via un PID de vitesse.
+void deplacerRoueDroitePid(int consigne) {
+  outputdroite = calculerPidDroit(encD/10, consigne);// calcule la commande
+  Serial.print("outputdroite : ");                   // debug
+  Serial.println(outputdroite);                      // ...
+
+  outputdroite = constrain(outputdroite, -255, 255); // borne PWM
+  if (outputdroite > 0) {                            // sens avant
+    analogWrite(IN_1_D, 0);                          // ...
+    analogWrite(IN_2_D, outputdroite);               // ...
+  } else {                                           // sens arriere
+    analogWrite(IN_2_D, 0);                          // ...
+    analogWrite(IN_1_D, -outputdroite);              // ...
+  }
+}
+
+double outputangle= 0;                               // sortie du PID d'angle (gyro)
+
+float rayoncercle = 50;                              // rayon de cercle par defaut (reglable Bluetooth)
+float angleFin = 3*PI+0.2;                           // angle de fin par defaut (reglable Bluetooth)
+
+double Kp=2.0, Ki=0.12, Kd=0.0;                      // coefficients du PID de roue (vitesse)
+
+float sommeErreurs = 0;                              // somme d'erreurs generique (non utilise partout)
+float erreurPrecedente = 0;                          // erreur precedente generique
+
+// PID de vitesse de la roue GAUCHE (coefficients Kp/Ki/Kd communs aux deux roues).
+int calculerPidGauche(int input, int consigne) {
+  static float sommeErreursgauche = 0;               // integrale (conservee entre appels)
+  static float erreurPrecedentegauche = 0;           // erreur precedente
+
+  float erreur = consigne - input;                   // ecart
+
+  float termeP = Kp * erreur;                         // terme proportionnel
+
+  sommeErreursgauche += erreur;                       // integrale
+  float termeI = Ki * sommeErreursgauche;             // terme integral
+
+  float termeD = Kd * (erreur - erreurPrecedentegauche);  // terme derive
+  erreurPrecedentegauche = erreur;                    // memorise
+
+  return termeP + termeI + termeD;                    // commande
+}
+
+// PID de vitesse de la roue DROITE.
+int calculerPidDroit(int input, int consigne) {
+  static float sommeErreursdroite = 0;               // integrale
+  static float erreurPrecedentedroite = 0;           // erreur precedente
+
+  float erreur = consigne - input;                   // ecart
+
+  float termeP = Kp * erreur;                         // proportionnel
+
+  sommeErreursdroite += erreur;                       // integrale
+  float termeI = Ki * sommeErreursdroite;             // integral
+
+  float termeD = Kd * (erreur - erreurPrecedentedroite);  // derive
+  erreurPrecedentedroite = erreur;                    // memorise
+
+  return termeP + termeI + termeD;                    // commande
+}
+
+// PID d'orientation base sur l'angle du GYROSCOPE (coefficients KpGyro/KiGyro/KdGyro).
+int calculerPidGyro(float angleActuel, float angleCible) {
+  static float sommeErreursGyro = 0;                 // integrale
+  static float erreurPrecedenteGyro = 0;             // erreur precedente
+
+  float erreur = angleCible - angleActuel;           // ecart angulaire
+
+  float termeP = KpGyro * erreur;                     // proportionnel
+
+  sommeErreursGyro += erreur;                          // integrale
+  sommeErreursGyro = constrain(sommeErreursGyro, -2000, 2000);  // anti-emballement
+  float termeI = KiGyro * sommeErreursGyro;            // integral
+
+  float termeD = KdGyro * (erreur - erreurPrecedenteGyro);  // derive
+  erreurPrecedenteGyro = erreur;                       // memorise
+  Serial.print("erreur : ");                           // debug
+  Serial.print(erreur);                                // ...
+  Serial.print("   termeP : ");                        // ...
+  Serial.print(termeP);                                // ...
+  Serial.print("   termeI : ");                        // ...
+  Serial.print(termeI);                                // ...
+  Serial.print("   termeD : ");                        // ...
+  Serial.println(termeD);                              // ...
+
+  return termeP + termeI + termeD;                     // commande
+}
+
+// Maintient un cap donne en pilotant les deux roues via le PID gyroscopique.
+void asservirAngleSeul(float anglecible){
+  float correctionAngle = calculerPidGyro(lireAngleGyroscope(), anglecible);  // correction
+
+  float vitesseGauche = -correctionAngle;            // les deux roues dans le meme sens (rotation sur place)
+  float vitesseDroite = -correctionAngle;            // ...
+  vitesseGauche = constrain(vitesseGauche, -255, 255);  // borne
+  vitesseDroite = constrain(vitesseDroite, -255, 255);  // borne
+  if (vitesseGauche > 0) {                           // roue gauche
+    analogWrite(IN_1_G, vitesseGauche);              // avant
+    analogWrite(IN_2_G, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_2_G, -vitesseGauche);             // arriere
+    analogWrite(IN_1_G, 0);                          // ...
+  }
+  if (vitesseDroite > 0) {                           // roue droite
+    analogWrite(IN_2_D, vitesseDroite);              // avant
+    analogWrite(IN_1_D, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_1_D, -vitesseDroite);             // arriere
+    analogWrite(IN_2_D, 0);                          // ...
+  }
+}
+
+// Securite anti-bascule : si le robot penche trop, coupe les moteurs ; sinon maintient le cap.
+void tenirDebout(float angleconsigne) {
+  if (abs(lireAngleGyroscope() - angleconsigne) > 45) {  // si l'inclinaison depasse 45 deg
+    analogWrite(IN_1_G, 0);                          // coupe roue gauche
+    analogWrite(IN_2_G, 0);                          // ...
+    analogWrite(IN_1_D, 0);                          // coupe roue droite
+    analogWrite(IN_2_D, 0);                          // ...
+    Serial.println("robot trop penché, arret commanderMoteur");  // message
+    delay(200);                                      // pause
+    return;                                          // ...
+  }
+  asservirAngleSeul(angleconsigne);                  // sinon, maintient le cap
+}
+
+int vitesseici = 150;                                // vitesse fixe pour allerAPosition
+
+// Rejoint une position (x, y) par un pilotage simple roue par roue (sans PID fin).
+void allerAPosition(float x, float y) {
+  while(abs(posstyloX - x) > 50 || abs(posstyloY - y) > 50) {  // tant qu'on est loin (tolerance 50 mm)
+    Serial.print("posstyloX : ");                    // debug
+    Serial.print(posstyloX);                         // ...
+    Serial.print(" posstyloY : ");                   // ...
+    Serial.println(posstyloY);                       // ...
+    if (posstyloX < x) {                             // si trop a gauche en X
+      commanderMoteur(SENS_AVANT, vitesseici, MOTEUR_GAUCHE);   // roue gauche avant
+    } else if (posstyloX > x) {                      // si trop a droite
+      commanderMoteur(SENS_ARRIERE, vitesseici, MOTEUR_GAUCHE); // roue gauche arriere
+    } else {                                         // sinon
+      commanderMoteur(SENS_AVANT, 0, MOTEUR_GAUCHE); // roue gauche stop
+    }
+    if (posstyloY < y) {                             // idem en Y avec la roue droite
+      commanderMoteur(SENS_AVANT, vitesseici, MOTEUR_DROIT);    // ...
+    } else if (posstyloY > y) {                      // ...
+      commanderMoteur(SENS_ARRIERE, vitesseici, MOTEUR_DROIT);  // ...
+    } else {                                         // ...
+      commanderMoteur(SENS_AVANT, 0, MOTEUR_DROIT);  // ...
+    }
+    delay(10);                                       // laisse bouger
+    commanderMoteur(SENS_AVANT, 0, MOTEUR_GAUCHE);   // stop gauche
+    commanderMoteur(SENS_AVANT, 0, MOTEUR_DROIT);    // stop droit
+    delay(10);                                       // pause
+  }
+}
+
+// Calcule (et affiche) l'angle vers un point — utilitaire de debug, ne deplace pas le robot.
+void allerAPosition2(float x, float y) {
+  float angleverslepoint = atan2(y - robotY, x - robotX);  // cap vers le point
+  float angleActuel = anglerobot;                    // cap courant
+
+  angleverslepoint = normaliserAngle(angleverslepoint);  // recale
+  angleActuel = normaliserAngle(angleActuel);        // recale
+
+  float differenceAngle = normaliserAngle(angleverslepoint - angleActuel);  // ecart
+
+  Serial.print("angleverslepoint (rad): ");          // debug
+  Serial.print(angleverslepoint);                    // ...
+  Serial.print("difference angle (rad): ");          // ...
+  Serial.println(differenceAngle);                   // ...
+}
+
+// Avance droit sur l'axe Y avec une vitesse bridee (variante de avancerToutDroit).
+void avancerToutDroit2(int distance,float angleconsigne) {
+  const int maxvitesse = 80;                         // vitesse max bridee
+
+  float correctionAngle = pidAngle(anglerobot, angleconsigne);  // correction de cap
+  float correctionDistance = pidDistance(robotY, -distance);    // correction d'avance (sur Y)
+  Serial.print("correctionAngle : ");                // debug
+  Serial.print(correctionAngle);                     // ...
+  Serial.print("   correctionDistance : ");          // ...
+  Serial.println(correctionDistance);                // ...
+
+  float vitesseGauche = correctionDistance - correctionAngle;  // melange
+  float vitesseDroite = correctionDistance + correctionAngle;  // melange
+  vitesseGauche = constrain(vitesseGauche, -maxvitesse, maxvitesse);  // borne bridee
+  vitesseDroite = constrain(vitesseDroite, -maxvitesse, maxvitesse);  // borne bridee
+  if (vitesseGauche > 0) {                           // roue gauche
+    analogWrite(IN_1_G, vitesseGauche);              // avant
+    analogWrite(IN_2_G, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_2_G, -vitesseGauche);             // arriere
+    analogWrite(IN_1_G, 0);                          // ...
+  }
+  if (vitesseDroite > 0) {                           // roue droite
+    analogWrite(IN_2_D, vitesseDroite);              // avant
+    analogWrite(IN_1_D, 0);                          // ...
+  } else {                                           // ...
+    analogWrite(IN_1_D, -vitesseDroite);             // arriere
+    analogWrite(IN_2_D, 0);                          // ...
+  }
+}
+
+
+// ============================================================================
+//   INITIALISATION, SETUP & BOUCLE PRINCIPALE
+// ============================================================================
+
+// Initialise le magnetometre LIS3MDL (mode ultra haute resolution, 300 Hz).
+void initMagnetometre() {
+  Serial.println("Adafruit LIS3MDL test!");          // message
+  if (!lis3mdl.begin_I2C(0x1E)) {                    // tente l'init I2C a l'adresse 0x1E
+    Serial.println("Failed to find LIS3MDL chip");   // echec
+    while (1) { delay(10); }                         // ... bloque ici
+  }
+  Serial.println("LIS3MDL Found!");                  // succes
+  lis3mdl.setPerformanceMode(LIS3MDL_ULTRAHIGHMODE); // mode haute resolution
+  lis3mdl.setOperationMode(LIS3MDL_CONTINUOUSMODE);  // mesure continue
+  lis3mdl.setDataRate(LIS3MDL_DATARATE_300_HZ);      // 300 Hz
+  lis3mdl.setRange(LIS3MDL_RANGE_4_GAUSS);           // plage +/-4 gauss
+}
+
+float gyroscopeOffset = 0;                           // biais gyroscope (non utilise ici)
+
+// Initialise la centrale inertielle (IMU LSM6DS3).
+void initCentraleInertielle() {
+  IMU.begin();                                       // demarre l'IMU
+}
+
+// Configure les broches des encodeurs et attache les interruptions (4 voies, front CHANGE).
+void initBrochesEncodeurs() {
+  pinMode(ENC_G_CH_A, INPUT);                        // voie A gauche en entree
+  pinMode(ENC_G_CH_B, INPUT);                        // voie B gauche
+  pinMode(ENC_D_CH_A, INPUT);                        // voie A droite
+  pinMode(ENC_D_CH_B, INPUT);                        // voie B droite
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_A), interruptionEncodeurGaucheA, CHANGE);  // IT voie A gauche
+  attachInterrupt(digitalPinToInterrupt(ENC_G_CH_B), interruptionEncodeurGaucheB, CHANGE);  // IT voie B gauche
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_A), interruptionEncodeurDroitA, CHANGE);   // IT voie A droite
+  attachInterrupt(digitalPinToInterrupt(ENC_D_CH_B), interruptionEncodeurDroitB, CHANGE);   // IT voie B droite
+}
+
+// Configure toutes les broches d'entree/sortie (LEDs, moteurs, microswitch, servo).
+void initBroches() {
+  pinMode(LEDU1, OUTPUT);                            // LED1 en sortie
+  pinMode(LEDU2, OUTPUT);                            // LED2 en sortie
+  pinMode(EN_D, OUTPUT);                             // ENABLE droit
+  pinMode(EN_G, OUTPUT);                             // ENABLE gauche
+  pinMode(EN_D, OUTPUT);                             // (doublon sans effet)
+  pinMode(EN_G, OUTPUT);                             // (doublon sans effet)
+  pinMode(MICROSWITCH_PIN, INPUT_PULLUP);            // microswitch avec pull-up interne
+  pinMode(SERVO_PIN, OUTPUT);                        // servo en sortie
+  pinMode(LED_BUILTIN, OUTPUT);                      // LED integree
+
+  pinMode(IN_1_D, OUTPUT);                           // entrees du pont en H, moteur droit
+  pinMode(IN_2_D, OUTPUT);                           // ...
+  pinMode(IN_1_G, OUTPUT);                           // entrees du pont en H, moteur gauche
+  pinMode(IN_2_G, OUTPUT);                           // ...
+}
+
+// Active les drivers moteurs (ENABLE haut) et met les entrees a l'arret.
+void initMoteurs() {
+  digitalWrite(EN_D, HIGH);                          // active driver droit
+  digitalWrite(EN_G, HIGH);                          // active driver gauche
+
+  digitalWrite(IN_1_D, LOW);                         // moteurs a l'arret au demarrage
+  digitalWrite(IN_2_D, LOW);                         // ...
+  digitalWrite(IN_1_G, LOW);                         // ...
+  digitalWrite(IN_2_G, LOW);                         // ...
+}
+
+// Initialisation generale du robot (a appeler une fois au demarrage).
+void initialisationComplete() {
+  allumerLeds();                                     // LEDs allumees (signale "demarrage")
+  Wire.begin();                                      // demarre l'I2C
+  Wire.setClock(400000);                             // I2C en mode rapide (400 kHz)
+  Serial.begin(115200);                              // port serie a 115200 bauds
+  Serial.println("Init");                            // message
+
+  initBroches();                                     // configure les broches
+  initMoteurs();                                     // active les moteurs
+  initCentraleInertielle();                          // demarre l'IMU
+  initBrochesEncodeurs();                            // configure encodeurs + interruptions
+
+  digitalWrite(LED_BUILTIN, LOW);                    // eteint la LED integree
+
+  initBluetooth();                                   // demarre le Bluetooth
+
+  xTaskCreatePinnedToCore(                           // cree une tache sur le coeur 0...
+    tacheCalculPosition,                             // fonction de la tache
+    "Calculelapositionstylo",                        // nom
+    10000,                                           // taille de pile
+    NULL,                                            // parametre
+    1,                                               // priorite
+    &Core0Task,                                      // handle
+    0);                                              // coeur 0
+
+  Serial.println("Init complete");                   // message
+}
+
+TaskHandle_t Core0Task;                              // handle de la tache coeur 0
+TaskHandle_t Core1Task;                              // handle de la tache coeur 1 (non utilise)
+double Setpoint=82.8, Input, Output;                 // consigne/mesure/sortie PID generiques
+
+float angleconsigne = 0;                             // cap consigne (usage interne)
+float angleactuel = 0;                               // cap actuel (usage interne)
+float angledugyro = 0;                               // angle issu du gyroscope
+
+int vitesse = 100;                                   // vitesse generique
+int sens = SENS_AVANT;                               // sens generique
+long int encG = 0;                                   // compteur encodeur gauche
+long int encD = 0;                                   // compteur encodeur droit
+
+float distG = 0;                                     // distance roue gauche (mm)
+float distD = 0;                                     // distance roue droite (mm)
+
+// Tache FreeRTOS (coeur 0) : envoie regulierement la position par Bluetooth.
+void tacheCalculPosition(void *parameter) {
+  for (;;) {                                         // boucle infinie de la tache
+    envoyerCoordonnees();                            // envoie la position du stylo
+    vTaskDelay(800 / portTICK_PERIOD_MS);            // attend 800 ms (laisse la main aux autres taches)
+  }
+}
+
+int encGavant = 0;                                   // ancienne valeur encodeur gauche (usage interne)
+int encDavant = 0;                                   // ancienne valeur encodeur droit (usage interne)
+
+bool variablewifibouton = true;                      // drapeau de demarrage de sequence (vrai = demarre)
+
+// Sequence : une fleche remplie (pointe hachuree).
+void sequenceFleche(){
+  tracerSegment(0,0,100, 0);                         // hampe de la fleche
+  tracerSegment(100, 0,70,-15);                      // barbe inferieure
+  tracerSegment(70,-15,70, 15);                      // base de la pointe
+  tracerSegment(70, 15,100, 0);                      // barbe superieure
+
+  for (int i = 0; i < 15; i++) {                     // remplissage de la pointe par hachures
+    tracerSegment(100,0 , 70, -15 + i);              // hachure (bas vers pointe)
+    tracerSegment( 70, -15 + i,100, 0);              // retour
+    tracerSegment(100,0,70, 15 - i);                 // hachure (haut vers pointe)
+    tracerSegment(70, 15 - i,100, 0);                // retour
+  }
+}
+
+#define TEMPS_AVANT_START 15                         // (ancien) delai avant coupure moteurs (s)
+
+hw_timer_t *timer = NULL;                             // timer materiel (utilise par l'ancien mode match)
+
+// Interruption de timer (ancien mode match) : coupe les moteurs et baisse le stylo.
+void IRAM_ATTR onTimer() {
+  digitalWrite(EN_D, LOW);                           // coupe driver droit
+  digitalWrite(EN_G, LOW);                           // coupe driver gauche
+  analogWrite(SERVO_PIN, 50);                        // position servo (stylo)
+}
+
+#define NO_WAIT 1                                    // 1 = pas d'attente au demarrage (0 = attendre 85 s)
+
+// Point d'entree : initialise tout puis (selon NO_WAIT) attend ou non avant la boucle.
+void setup() {
+  initialisationComplete();                          // initialisation generale
+  if(NO_WAIT<0) delay(5000);                         // valeur negative -> attend 5 s
+  else if(!NO_WAIT) delay(85000);                    // NO_WAIT=0 -> attend 85 s (mode match) ; NO_WAIT=1 -> rien
+}
+
+// Boucle principale : lance la sequence puis fait clignoter les LED sans fin.
+void loop() {
+  sequenceEscalier();                                // <-- la sequence a dessiner (remplacer par une autre au besoin)
+  clignoterSansFin();                                // boucle infinie : le dessin ne se repete pas
+}
